@@ -1,0 +1,15 @@
+# MCP 聚合网关依赖
+# 运行环境：Python 3.12 (conda env: llm)
+
+# ASGI Web 框架（轻量，原生支持 SSE 流式响应）
+starlette>=0.37.0
+# ASGI 服务器
+uvicorn>=0.30.0
+# 异步 HTTP 客户端（支持流式响应、MockTransport 测试）
+httpx>=0.27.0
+# YAML 配置解析
+PyYAML>=6.0
+
+# ---- 测试依赖 ----
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
