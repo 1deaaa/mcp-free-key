@@ -96,7 +96,7 @@ class GatewayEditor:
             pass
         self._apply_styles()
 
-        self.config = load_config(str(CONFIG_PATH))
+        self.config = load_config(str(CONFIG_PATH), strict=False)
         self.current_index = 0 if self.config.services else -1
 
         self._build_ui()
