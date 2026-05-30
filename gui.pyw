@@ -546,45 +546,67 @@ class GatewayEditor:
         """弹窗批量导入密钥，自动去重。"""
         dialog = tk.Toplevel(self.root)
         dialog.title("批量导入密钥")
-        # 调整窗体大小为 700x500，确保高分屏下也能完美容纳所有内容，并锁死大小
-        dialog.geometry("700x500")
-        dialog.resizable(False, False)
+        dialog.geometry("800x560")
+        dialog.minsize(600, 400)
         dialog.transient(self.root)
         dialog.grab_set()
-        
-        # 居中
-        dialog.geometry(f"+{self.root.winfo_x() + 50}+{self.root.winfo_y() + 50}")
-        
-        ttk.Label(dialog, text="请输入密钥列表（每行一个，自动去重并过滤空白行）:", font=FONT_BOLD).pack(anchor="w", padx=16, pady=(16, 8))
-        
-        text_area = tk.Text(dialog, font=FONT_MONO, wrap="none", relief="solid", bd=1)
-        text_area.pack(fill="both", expand=True, padx=16, pady=8)
+
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(1, weight=1)
+
+        ttk.Label(dialog, text="请输入密钥列表（每行一个，自动去重并过滤空白行）:", font=FONT_BOLD).grid(
+            row=0, column=0, sticky="w", padx=16, pady=(16, 8)
+        )
+
+        text_frame = ttk.Frame(dialog)
+        text_frame.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
+        text_frame.columnconfigure(0, weight=1)
+        text_frame.rowconfigure(0, weight=1)
+
+        text_area = tk.Text(text_frame, font=FONT_MONO, wrap="none", relief="solid", bd=1)
+        text_area.grid(row=0, column=0, sticky="nsew")
+
+        h_scroll = ttk.Scrollbar(text_frame, orient="horizontal", command=text_area.xview)
+        h_scroll.grid(row=1, column=0, sticky="ew")
+        v_scroll = ttk.Scrollbar(text_frame, orient="vertical", command=text_area.yview)
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        text_area.configure(xscrollcommand=h_scroll.set, yscrollcommand=v_scroll.set)
+
+        def _on_paste(event=None):
+            try:
+                clip = dialog.clipboard_get()
+                clip = clip.replace("\r\n", "\n").replace("\r", "\n")
+                text_area.insert("insert", clip)
+            except tk.TclError:
+                pass
+            return "break"
+
+        text_area.bind("<<Paste>>", _on_paste)
         text_area.focus_set()
-        
+
         def do_import():
             raw_text = text_area.get("1.0", "end")
-            # 自动对所有待导入的密钥进行一次去重
             imported_keys = split_lines(raw_text)
             if not imported_keys:
                 dialog.destroy()
                 return
-                
+
             svc = self.config.services[self.current_index]
             old_count = len(svc.keys)
-            
-            # 合并并去重（对已经保存的密钥和新导入的密钥进行一次去重）
+
             svc.keys = dedupe_keep_order(svc.keys + imported_keys)
             new_added = len(svc.keys) - old_count
-            
+
             self._refresh_keys_tree(svc)
             self._log(f"批量导入完成：成功导入并新增 {new_added} 个密钥（已自动去重）")
             dialog.destroy()
             messagebox.showinfo(APP_TITLE, f"成功导入并新增 {new_added} 个密钥！\n已自动过滤重复项。")
-            
+
         btn_row = ttk.Frame(dialog)
-        btn_row.pack(fill="x", padx=16, pady=16)
-        ttk.Button(btn_row, text="导入", command=do_import).pack(side="right", padx=(8, 0))
-        ttk.Button(btn_row, text="取消", command=dialog.destroy).pack(side="right")
+        btn_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 16))
+        btn_row.columnconfigure((0, 1), weight=1)
+        ttk.Button(btn_row, text="取消", command=dialog.destroy).grid(row=0, column=0, sticky="e", padx=(0, 8))
+        ttk.Button(btn_row, text="导入", command=do_import).grid(row=0, column=1, sticky="w")
 
     def _delete_selected_keys(self) -> None:
         """删除选中的单个或批量密钥。"""
