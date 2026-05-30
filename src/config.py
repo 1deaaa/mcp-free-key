@@ -178,11 +178,12 @@ def _save_env_keys(gateway_keys: list[str], services_keys: dict[str, list[str]])
         f.write("\n".join(lines) + "\n")
 
 
-def load_config(path: str | None = None) -> AppConfig:
+def load_config(path: str | None = None, *, strict: bool = True) -> AppConfig:
     """从 YAML 文件加载并校验配置，同时从 .env 文件加载密钥。
 
     Args:
         path: 配置文件路径，默认 项目根/config.yaml。
+        strict: 是否执行校验。GUI 编辑器传 False 以允许加载不完整配置。
 
     Returns:
         校验通过的 AppConfig 实例。
@@ -220,7 +221,8 @@ def load_config(path: str | None = None) -> AppConfig:
         services.append(svc)
 
     config = AppConfig(gateway=gateway, services=services)
-    config.validate()
+    if strict:
+        config.validate()
     return config
 
 
