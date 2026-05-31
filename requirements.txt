@@ -9,6 +9,8 @@ uvicorn>=0.30.0
 httpx>=0.27.0
 # YAML 配置解析
 PyYAML>=6.0
+# 现代化 GUI 框架
+customtkinter>=5.2.0
 
 # ---- 测试依赖 ----
 pytest>=8.0.0
