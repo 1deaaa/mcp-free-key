@@ -1,28 +1,24 @@
 # -*- coding: utf-8 -*-
-r"""MCP 聚合网关配置编辑器。
+"""MCP 聚合网关配置编辑器 - CustomTkinter 重构版。
 
 功能：
 - 编辑网关端口、统一访问密钥。
 - 增删改 MCP 服务（上游 URL、密钥注入方式、失败特征）。
-- 批量添加密钥、自动去重、从旧版 .key 文件导入。
-- 测试单个服务的全部密钥是否有效且有额度。
-
-布局：
-- 顶部：网关设置栏（端口 + 访问密钥 + 操作按钮）
-- 左侧：服务列表
-- 右侧：选中服务的详情编辑区
-- 底部：测试日志
-
-高分屏：启动时启用 DPI 感知，所有字体 ≥ 13pt。
+- 批量添加密钥、自动去重。
+- 测试选中/全部密钥是否有效且有额度。
 """
 from __future__ import annotations
 
 import asyncio
 import ctypes
+import json
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
+
+import customtkinter as ctk
 
 from src.config import (
     DEFAULT_CONFIG_PATH,
@@ -31,35 +27,30 @@ from src.config import (
     ServiceConfig,
     dump_config,
     load_config,
-    parse_legacy_key_file,
 )
 from src.validator import validate_keys
 
-APP_TITLE = "MCP 聚合网关配置器"
+# ── 主题 ──────────────────────────────────────────────────────────────────────
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+APP_TITLE = "MCP 聚合网关"
 CONFIG_PATH = Path(DEFAULT_CONFIG_PATH)
 
-# 统一字号
-FONT_FAMILY = "Microsoft YaHei UI"
-FONT_NORMAL = (FONT_FAMILY, 13)
-FONT_BOLD = (FONT_FAMILY, 13, "bold")
-FONT_TITLE = (FONT_FAMILY, 16, "bold")
-FONT_MONO = ("Consolas", 13)
-
-
-def enable_high_dpi(root: tk.Tk) -> None:
-    """启用高分屏支持。"""
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
-    try:
-        scale = root.winfo_fpixels("1i") / 72.0
-        root.tk.call("tk", "scaling", max(1.4, min(scale, 2.2)))
-    except Exception:
-        pass
+# 颜色常量
+CLR_BG       = "#1a1a2e"
+CLR_PANEL    = "#16213e"
+CLR_CARD     = "#0f3460"
+CLR_ACCENT   = "#4f8ef7"
+CLR_ACCENT2  = "#7c3aed"
+CLR_SUCCESS  = "#22c55e"
+CLR_WARN     = "#f59e0b"
+CLR_ERROR    = "#ef4444"
+CLR_TEXT     = "#e2e8f0"
+CLR_MUTED    = "#94a3b8"
+CLR_BORDER   = "#334155"
+CLR_ENTRY_BG = "#1e293b"
+CLR_HOVER    = "#2d4a7a"
 
 
 def dedupe_keep_order(values: list[str]) -> list[str]:
@@ -80,21 +71,19 @@ def split_lines(text: str) -> list[str]:
     return dedupe_keep_order(text.replace("\r", "").split("\n"))
 
 
+# ── 主窗口 ────────────────────────────────────────────────────────────────────
 class GatewayEditor:
     """图形界面主控制器。"""
 
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: ctk.CTk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("1600x900")
-        self.root.minsize(1600, 900)
+        self.root.geometry("1280x800")
+        self.root.minsize(1100, 700)
 
-        self.style = ttk.Style()
-        try:
-            self.style.theme_use("vista")
-        except Exception:
-            pass
-        self._apply_styles()
+        # 实例级缓存（避免类变量在多实例间共享）
+        self._stats_cache: dict = {}
+        self._stats_cache_time: float = 0.0
 
         self.config = load_config(str(CONFIG_PATH), strict=False)
         self.current_index = 0 if self.config.services else -1
@@ -103,228 +92,297 @@ class GatewayEditor:
         self._load_gateway()
         self._refresh_service_list(select_index=self.current_index)
 
-    # ------------------------------------------------------------------ 样式
-    def _apply_styles(self) -> None:
-        s = self.style
-        s.configure(".", font=FONT_NORMAL)
-        s.configure("TLabel", font=FONT_NORMAL)
-        s.configure("TButton", font=FONT_NORMAL, padding=(12, 6))
-        s.configure("TEntry", font=FONT_NORMAL)
-        s.configure("TCombobox", font=FONT_NORMAL)
-        s.configure("TCheckbutton", font=FONT_NORMAL)
-        s.configure("TLabelframe", font=FONT_BOLD)
-        s.configure("TLabelframe.Label", font=FONT_BOLD)
-        s.configure("TNotebook.Tab", font=FONT_NORMAL, padding=(16, 8))
-        s.configure("Header.TLabel", font=FONT_TITLE)
-
-    # ------------------------------------------------------------------ 布局
+    # ── 布局构建 ──────────────────────────────────────────────────────────────
     def _build_ui(self) -> None:
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_rowconfigure(0, weight=1)
 
-        outer = ttk.Frame(self.root, padding=16)
+        # 最外层容器
+        outer = ctk.CTkFrame(self.root, fg_color=CLR_BG, corner_radius=0)
         outer.grid(row=0, column=0, sticky="nsew")
-        outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(2, weight=1)
+        outer.grid_columnconfigure(0, weight=1)
+        outer.grid_rowconfigure(1, weight=1)
 
-        # ---- 标题
-        ttk.Label(outer, text=APP_TITLE, style="Header.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 12))
+        self._build_header(outer)
+        self._build_body(outer)
 
-        # ---- 顶部：网关设置
-        gw_frame = ttk.LabelFrame(outer, text="网关设置", padding=12)
-        gw_frame.grid(row=1, column=0, sticky="ew", pady=(0, 12))
-        for i in range(6):
-            gw_frame.columnconfigure(i, weight=1 if i in (1, 3) else 0)
+    def _build_header(self, parent) -> None:
+        """顶部标题栏 + 网关设置（单行紧凑布局）。"""
+        header = ctk.CTkFrame(parent, fg_color=CLR_PANEL, corner_radius=0, height=60)
+        header.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
+        header.grid_columnconfigure(1, weight=1)
+        header.grid_propagate(False)
 
-        self.port_var = tk.StringVar()
-        self.gw_key_var = tk.StringVar()
-        self.cooldown_var = tk.StringVar()
-        self.ttl_var = tk.StringVar()
-        self.retry_var = tk.StringVar()
-        self.timeout_var = tk.StringVar()
+        # 左侧品牌标题（紧凑单行）
+        title_box = ctk.CTkFrame(header, fg_color="transparent")
+        title_box.grid(row=0, column=0, sticky="ns", padx=(16, 20), pady=8)
+        ctk.CTkLabel(title_box, text="⚡ MCP Gateway",
+                     font=ctk.CTkFont(size=16, weight="bold"),
+                     text_color=CLR_ACCENT).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(title_box, text="聚合网关配置管理器",
+                     font=ctk.CTkFont(size=11),
+                     text_color=CLR_MUTED).pack(side="left")
 
-        r = 0
-        ttk.Label(gw_frame, text="端口").grid(row=r, column=0, sticky="w", padx=(0, 6))
-        e_port = ttk.Entry(gw_frame, textvariable=self.port_var, width=8)
-        e_port.grid(row=r, column=1, sticky="w", padx=(0, 16))
+        # 右侧：所有网关参数一行排列
+        gw_box = ctk.CTkFrame(header, fg_color="transparent")
+        gw_box.grid(row=0, column=1, sticky="nsew", padx=(0, 16), pady=8)
+        self._build_gateway_fields(gw_box)
 
-        ttk.Label(gw_frame, text="访问密钥").grid(row=r, column=2, sticky="w", padx=(0, 6))
-        # 主密钥不需要隐藏起来了，直接显示即可，移除 show="*"
-        ttk.Entry(gw_frame, textvariable=self.gw_key_var, width=40).grid(row=r, column=3, sticky="ew", padx=(0, 16))
+    def _build_gateway_fields(self, parent) -> None:
+        """网关参数输入区（单行）。"""
+        self.port_var     = ctk.StringVar()
+        self.gw_key_var   = ctk.StringVar()
+        self.cooldown_var = ctk.StringVar()
+        self.ttl_var      = ctk.StringVar()
+        self.retry_var    = ctk.StringVar()
+        self.timeout_var  = ctk.StringVar()
 
-        r = 1
-        ttk.Label(gw_frame, text="密钥冷却(秒)").grid(row=r, column=0, sticky="w", padx=(0, 6), pady=(8, 0))
-        ttk.Entry(gw_frame, textvariable=self.cooldown_var, width=8).grid(row=r, column=1, sticky="w", padx=(0, 16), pady=(8, 0))
+        # 全部参数一行
+        self._lbl_entry(parent, "端口", self.port_var, width=70)
+        self._lbl_entry(parent, "访问密钥", self.gw_key_var, width=260)
+        self._lbl_entry(parent, "冷却(秒)", self.cooldown_var, width=70)
+        self._lbl_entry(parent, "TTL(秒)", self.ttl_var, width=70)
+        self._lbl_entry(parent, "重试", self.retry_var, width=50)
+        self._lbl_entry(parent, "超时(秒)", self.timeout_var, width=70)
 
-        ttk.Label(gw_frame, text="会话TTL(秒)").grid(row=r, column=2, sticky="w", padx=(0, 6), pady=(8, 0))
-        ttk.Entry(gw_frame, textvariable=self.ttl_var, width=8).grid(row=r, column=3, sticky="w", padx=(0, 16), pady=(8, 0))
+    def _lbl_entry(self, parent, label: str, var: ctk.StringVar, width: int = 120) -> None:
+        """标签 + 输入框组合（横向排列）。"""
+        ctk.CTkLabel(parent, text=label, font=ctk.CTkFont(size=12),
+                     text_color=CLR_MUTED).pack(side="left", padx=(0, 4))
+        ctk.CTkEntry(parent, textvariable=var, width=width,
+                     fg_color=CLR_ENTRY_BG, border_color=CLR_BORDER,
+                     text_color=CLR_TEXT, font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 16))
 
-        ttk.Label(gw_frame, text="最大重试").grid(row=r, column=4, sticky="w", padx=(0, 6), pady=(8, 0))
-        ttk.Entry(gw_frame, textvariable=self.retry_var, width=6).grid(row=r, column=5, sticky="w", pady=(8, 0))
-
-        # ---- 中部：左服务列表 + 右编辑区
-        mid = ttk.Frame(outer)
-        mid.grid(row=2, column=0, sticky="nsew", pady=(0, 12))
-        mid.columnconfigure(1, weight=1)
-        mid.rowconfigure(0, weight=1)
+    def _build_body(self, parent) -> None:
+        """中部主体：左侧服务列表（固定宽）+ 右侧编辑区（拉伸）。"""
+        body = ctk.CTkFrame(parent, fg_color="transparent")
+        body.grid(row=1, column=0, sticky="nsew", padx=16, pady=16)
+        body.grid_columnconfigure(0, weight=0, minsize=200)  # 左侧固定
+        body.grid_columnconfigure(1, weight=1)               # 右侧拉伸
+        body.grid_rowconfigure(0, weight=1)
 
         # 左侧：服务列表
-        left = ttk.LabelFrame(mid, text="服务列表", padding=12)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
-        left.rowconfigure(0, weight=1)
-        left.columnconfigure(0, weight=1)
+        self._build_service_list(body)
+        # 右侧：编辑区 + 日志
+        self._build_right_panel(body)
 
-        self.svc_listbox = tk.Listbox(left, width=28, font=FONT_NORMAL, activestyle="none", relief="solid", bd=1)
-        self.svc_listbox.grid(row=0, column=0, sticky="nsew")
+    def _build_service_list(self, parent) -> None:
+        """左侧服务列表面板。"""
+        left = ctk.CTkFrame(parent, fg_color=CLR_CARD, corner_radius=8, width=200)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        left.grid_propagate(False)
+        left.grid_rowconfigure(1, weight=1)   # 列表行拉伸
+        left.grid_columnconfigure(0, weight=1)
+
+        # 标题
+        ctk.CTkLabel(left, text="📋 服务列表", font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=CLR_ACCENT).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 6))
+
+        # 列表框（不设 width，让 grid 控制宽度）
+        self.svc_listbox = tk.Listbox(left, font=("Microsoft YaHei UI", 11),
+                                      bg=CLR_ENTRY_BG, fg=CLR_TEXT, selectmode="single",
+                                      activestyle="none", relief="flat", bd=0,
+                                      highlightthickness=0,
+                                      selectbackground=CLR_HOVER, selectforeground=CLR_TEXT)
+        self.svc_listbox.grid(row=1, column=0, sticky="nsew", padx=(10, 0), pady=(0, 10))
         self.svc_listbox.bind("<<ListboxSelect>>", self._on_select)
 
-        btn_row = ttk.Frame(left)
-        btn_row.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        btn_row.columnconfigure((0, 1), weight=1)
-        # 暂时注释掉服务列表的“添加”和“删除”按钮
-        # ttk.Button(btn_row, text="＋ 添加", command=self._add_service).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        # ttk.Button(btn_row, text="－ 删除", command=self._delete_service).grid(row=0, column=1, sticky="ew", padx=(4, 0))
-        ttk.Label(btn_row, text="服务列表已锁定", font=FONT_BOLD, foreground="gray").grid(row=0, column=0, columnspan=2, pady=4)
+        # 滚动条
+        scrollbar = tk.Scrollbar(left, command=self.svc_listbox.yview,
+                                 bg=CLR_BORDER, activebackground=CLR_HOVER,
+                                 troughcolor=CLR_ENTRY_BG, width=6, relief="flat")
+        scrollbar.grid(row=1, column=1, sticky="ns", padx=(0, 6), pady=(0, 10))
+        self.svc_listbox.config(yscrollcommand=scrollbar.set)
 
-        # 右侧：服务编辑
-        right = ttk.LabelFrame(mid, text="服务详情", padding=12)
+    def _build_right_panel(self, parent) -> None:
+        """右侧编辑区 + 日志。"""
+        right = ctk.CTkFrame(parent, fg_color="transparent")
         right.grid(row=0, column=1, sticky="nsew")
-        right.columnconfigure(1, weight=1)
-        right.rowconfigure(3, weight=1) # 让下半部分容器拉伸
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(0, weight=1)
+        right.grid_rowconfigure(1, weight=0)
 
-        self.svc_name_var = tk.StringVar()
-        self.svc_enabled_var = tk.BooleanVar(value=True)
-        self.svc_url_var = tk.StringVar()
-        self.key_enabled_var = tk.BooleanVar(value=True)
-        self.key_type_var = tk.StringVar(value="header")
-        self.key_param_var = tk.StringVar()
+        # 上半部分：编辑区
+        self._build_service_editor(right)
+        # 下半部分：日志
+        self._build_log_panel(right)
 
-        r = 0
-        ttk.Label(right, text="服务名").grid(row=r, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
-        # 将服务名输入框设为只读（state="readonly"）
-        ttk.Entry(right, textvariable=self.svc_name_var, state="readonly").grid(row=r, column=1, sticky="ew", padx=(0, 8), pady=(0, 8))
-        ttk.Checkbutton(right, text="启用", variable=self.svc_enabled_var).grid(row=r, column=2, sticky="w", pady=(0, 8))
+    def _build_service_editor(self, parent) -> None:
+        """服务编辑区。"""
+        editor = ctk.CTkFrame(parent, fg_color=CLR_CARD, corner_radius=8)
+        editor.grid(row=0, column=0, sticky="nsew", padx=0, pady=(0, 12))
+        editor.grid_columnconfigure(0, weight=1)
+        editor.grid_rowconfigure(2, weight=1)
 
-        r = 1
-        ttk.Label(right, text="上游 URL").grid(row=r, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
-        # 将上游 URL 输入框设为只读（state="readonly"）
-        ttk.Entry(right, textvariable=self.svc_url_var, state="readonly").grid(row=r, column=1, columnspan=2, sticky="ew", pady=(0, 8))
+        # ── 标题 + 配置一行
+        hdr = ctk.CTkFrame(editor, fg_color="transparent")
+        hdr.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
+        ctk.CTkLabel(hdr, text="⚙️ 服务详情",
+                    font=ctk.CTkFont(size=13, weight="bold"),
+                    text_color=CLR_ACCENT).pack(side="left")
 
-        r = 2
-        ttk.Checkbutton(right, text="密钥轮询", variable=self.key_enabled_var).grid(row=r, column=0, sticky="w", pady=(0, 8))
-        ttk.Combobox(right, textvariable=self.key_type_var, values=["header", "query"], state="readonly", width=8).grid(row=r, column=1, sticky="w", padx=(0, 8), pady=(0, 8))
-        ttk.Entry(right, textvariable=self.key_param_var).grid(row=r, column=2, sticky="ew", pady=(0, 8))
+        # 变量声明
+        self.svc_name_var    = ctk.StringVar()
+        self.svc_enabled_var = ctk.BooleanVar(value=True)
+        self.svc_url_var     = ctk.StringVar()
+        self.key_enabled_var = ctk.BooleanVar(value=True)
+        self.key_type_var    = ctk.StringVar(value="header")
+        self.key_param_var   = ctk.StringVar()
 
-        r = 3
-        # 创建一个下半部分容器，用于完美控制左右比例
-        lower_frame = ttk.Frame(right)
-        lower_frame.grid(row=r, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
-        # 显式设置 uniform 组，强制 Tkinter 严格按照 3:1 的比例分配剩余空间，不受子控件默认大小的影响
-        lower_frame.columnconfigure(0, weight=3, uniform="lower_cols") # 密钥管理占 3/4 宽度
-        lower_frame.columnconfigure(1, weight=1, uniform="lower_cols") # 失败特征占 1/4 宽度
-        lower_frame.rowconfigure(0, weight=1)
+        # ── 配置一行：服务名 | 启用 | 上游URL | 密钥轮询 | 注入方式 | 字段名
+        cfg_row = ctk.CTkFrame(editor, fg_color="transparent")
+        cfg_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
 
-        # 左侧：密钥管理子框架
-        keys_frame = ttk.Frame(lower_frame)
-        keys_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
-        keys_frame.columnconfigure(0, weight=1)
-        keys_frame.rowconfigure(1, weight=1)
+        ctk.CTkLabel(cfg_row, text="服务名", text_color=CLR_MUTED,
+                    font=ctk.CTkFont(size=10)).pack(side="left", padx=(0, 4))
+        ctk.CTkEntry(cfg_row, textvariable=self.svc_name_var, state="readonly",
+                    fg_color=CLR_ENTRY_BG, border_color=CLR_BORDER,
+                    text_color=CLR_TEXT, font=ctk.CTkFont(size=11),
+                    width=110).pack(side="left", padx=(0, 6))
+        ctk.CTkCheckBox(cfg_row, text="启用", variable=self.svc_enabled_var,
+                       font=ctk.CTkFont(size=11), text_color=CLR_TEXT,
+                       width=60).pack(side="left", padx=(0, 14))
+        ctk.CTkLabel(cfg_row, text="|", text_color=CLR_BORDER,
+                    font=ctk.CTkFont(size=13)).pack(side="left", padx=(0, 14))
+        ctk.CTkLabel(cfg_row, text="上游URL", text_color=CLR_MUTED,
+                    font=ctk.CTkFont(size=10)).pack(side="left", padx=(0, 4))
+        ctk.CTkEntry(cfg_row, textvariable=self.svc_url_var, state="readonly",
+                    fg_color=CLR_ENTRY_BG, border_color=CLR_BORDER,
+                    text_color=CLR_TEXT, font=ctk.CTkFont(size=11)).pack(
+                    side="left", fill="x", expand=True, padx=(0, 14))
+        ctk.CTkLabel(cfg_row, text="|", text_color=CLR_BORDER,
+                    font=ctk.CTkFont(size=13)).pack(side="left", padx=(0, 14))
+        ctk.CTkCheckBox(cfg_row, text="密钥轮询", variable=self.key_enabled_var,
+                       font=ctk.CTkFont(size=11), text_color=CLR_TEXT,
+                       width=80).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(cfg_row, text="注入方式", text_color=CLR_MUTED,
+                    font=ctk.CTkFont(size=10)).pack(side="left", padx=(0, 4))
+        type_combo = ctk.CTkComboBox(cfg_row, variable=self.key_type_var,
+                       values=["header", "query"], state="readonly",
+                       fg_color=CLR_ENTRY_BG, border_color=CLR_BORDER,
+                       text_color=CLR_TEXT, font=ctk.CTkFont(size=10), width=90)
+        type_combo.pack(side="left", padx=(0, 10))
+        self._add_tooltip(type_combo,
+                         "header：密钥通过 HTTP 请求头传递（如 Authorization）\n"
+                         "query ：密钥通过 URL 查询参数传递（如 ?apiKey=xxx）")
+        ctk.CTkLabel(cfg_row, text="字段名", text_color=CLR_MUTED,
+                    font=ctk.CTkFont(size=10)).pack(side="left", padx=(0, 4))
+        ctk.CTkEntry(cfg_row, textvariable=self.key_param_var,
+                    fg_color=CLR_ENTRY_BG, border_color=CLR_BORDER,
+                    text_color=CLR_TEXT, font=ctk.CTkFont(size=10),
+                    width=150).pack(side="left")
 
-        # 密钥管理标题与删除按钮行
-        keys_title_row = ttk.Frame(keys_frame)
-        keys_title_row.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-        keys_title_row.columnconfigure(0, weight=1)
-        
-        ttk.Label(keys_title_row, text="密钥状态与管理").grid(row=0, column=0, sticky="sw")
-        ttk.Button(keys_title_row, text="删除选中密钥", command=self._delete_selected_keys, padding=(6, 2)).grid(row=0, column=1, sticky="e")
+        # ── 密钥管理 + 失败特征（两列布局）
+        lower = ctk.CTkFrame(editor, fg_color="transparent")
+        lower.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        lower.grid_columnconfigure(0, weight=2)  # 密钥列表占 2/3
+        lower.grid_columnconfigure(1, weight=1)  # 失败特征占 1/3
+        lower.grid_rowconfigure(1, weight=1)
 
-        # 右侧：失败特征子框架
-        patterns_frame = ttk.Frame(lower_frame)
-        patterns_frame.grid(row=0, column=1, sticky="nsew")
-        patterns_frame.columnconfigure(0, weight=1)
-        patterns_frame.rowconfigure(1, weight=1)
+        # 左侧：密钥列表
+        keys_lbl = ctk.CTkLabel(lower, text="🔑 密钥状态", font=ctk.CTkFont(size=11, weight="bold"),
+                               text_color=CLR_ACCENT)
+        keys_lbl.grid(row=0, column=0, sticky="w", pady=(0, 4))
 
-        ttk.Label(patterns_frame, text="失败特征（每行一个）").grid(row=0, column=0, sticky="sw", pady=(0, 4))
+        self.keys_tree = tk.Listbox(lower, height=6, font=("Consolas", 10),
+                                   bg=CLR_ENTRY_BG, fg=CLR_TEXT, selectmode="extended",
+                                   activestyle="none", relief="flat", bd=0,
+                                   highlightthickness=0)
+        self.keys_tree.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        keys_scroll = tk.Scrollbar(lower, command=self.keys_tree.yview,
+                                  bg=CLR_BORDER, activebackground=CLR_HOVER, width=8)
+        keys_scroll.grid(row=1, column=0, sticky="nse", padx=(0, 0))
+        self.keys_tree.config(yscrollcommand=keys_scroll.set)
 
-        r = 4
-        # 使用 Treeview 展示密钥（放在 keys_frame 中）
-        # 显式设置较宽的列宽，并让 Treeview 填充 keys_frame
-        self.keys_tree = ttk.Treeview(keys_frame, columns=("key", "status", "fails"), show="headings", height=8)
-        self.keys_tree.heading("key", text="密钥 (双击编辑/添加)")
-        self.keys_tree.heading("status", text="状态")
-        self.keys_tree.heading("fails", text="连续失败")
-        self.keys_tree.column("key", width=550, minwidth=300, stretch=True)
-        self.keys_tree.column("status", width=150, minwidth=100, stretch=False)
-        self.keys_tree.column("fails", width=100, minwidth=80, stretch=False)
-        self.keys_tree.grid(row=1, column=0, sticky="nsew")
+        # 右侧：失败特征
+        patterns_lbl = ctk.CTkLabel(lower, text="⚠️ 失败特征", font=ctk.CTkFont(size=11, weight="bold"),
+                                   text_color=CLR_ACCENT)
+        patterns_lbl.grid(row=0, column=1, sticky="w", pady=(0, 4))
 
-        # 为 Treeview 添加滚动条
-        keys_scroll = ttk.Scrollbar(keys_frame, orient="vertical", command=self.keys_tree.yview)
-        keys_scroll.grid(row=1, column=1, sticky="ns")
-        self.keys_tree.configure(yscrollcommand=keys_scroll.set)
+        self.patterns_text = tk.Text(lower, height=6, width=20, font=("Consolas", 10),
+                                    bg=CLR_ENTRY_BG, fg=CLR_TEXT, relief="flat", bd=0,
+                                    highlightthickness=0, wrap="none")
+        self.patterns_text.grid(row=1, column=1, sticky="nsew")
+        patterns_scroll = tk.Scrollbar(lower, command=self.patterns_text.yview,
+                                      bg=CLR_BORDER, activebackground=CLR_HOVER, width=8)
+        patterns_scroll.grid(row=1, column=1, sticky="nse")
+        self.patterns_text.config(yscrollcommand=patterns_scroll.set)
 
-        self.keys_tree.tag_configure("disabled", foreground="red", font=FONT_BOLD)
-        self.keys_tree.tag_configure("cooling", foreground="orange")
-        self.keys_tree.tag_configure("normal", foreground="green")
-        self.keys_tree.bind("<Double-1>", self._on_key_double_click)
+        # 操作按钮行
+        btn_row = ctk.CTkFrame(editor, fg_color="transparent")
+        btn_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
+        for i in range(5):
+            btn_row.grid_columnconfigure(i, weight=1)
 
-        # 失败特征文本框（放在 patterns_frame 中）
-        # 显式设置较小的 width=25，防止 tk.Text 默认 width=80 撑大布局，从而让 lower_frame 的 weight 比例（3:1）真正生效
-        self.patterns_text = tk.Text(patterns_frame, font=FONT_MONO, width=25, height=8, wrap="none", relief="solid", bd=1)
-        self.patterns_text.grid(row=1, column=0, sticky="nsew")
+        ctk.CTkButton(btn_row, text="💾 保存配置", command=self._save,
+                     fg_color=CLR_ACCENT, hover_color=CLR_HOVER,
+                     font=ctk.CTkFont(size=11, weight="bold")).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ctk.CTkButton(btn_row, text="📥 批量导入密钥", command=self._import_keys,
+                     fg_color="#0d9488", hover_color="#0f766e",
+                     font=ctk.CTkFont(size=11, weight="bold")).grid(row=0, column=1, sticky="ew", padx=4)
+        ctk.CTkButton(btn_row, text="🧪 测试选中密钥", command=self._test_selected_keys,
+                     fg_color=CLR_ACCENT2, hover_color="#6d28d9",
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=2, sticky="ew", padx=4)
+        ctk.CTkButton(btn_row, text="🧪 测试全部密钥", command=self._test_all_keys,
+                     fg_color="#0284c7", hover_color="#0369a1",
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=3, sticky="ew", padx=4)
+        ctk.CTkButton(btn_row, text="🗑️ 删除选中", command=self._delete_selected_keys,
+                     fg_color="#7f1d1d", hover_color="#991b1b",
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=4, sticky="ew", padx=(4, 0))
 
-        # 为失败特征添加滚动条
-        patterns_scroll = ttk.Scrollbar(patterns_frame, orient="vertical", command=self.patterns_text.yview)
-        patterns_scroll.grid(row=1, column=1, sticky="ns")
-        self.patterns_text.configure(yscrollcommand=patterns_scroll.set)
+    def _build_log_panel(self, parent) -> None:
+        """底部：MCP 示例 + 测试日志（左右分栏）。"""
+        bottom = ctk.CTkFrame(parent, fg_color="transparent")
+        bottom.grid(row=1, column=0, sticky="nsew")
+        bottom.grid_columnconfigure(0, weight=1)
+        bottom.grid_columnconfigure(1, weight=1)
+        bottom.grid_rowconfigure(0, weight=1)
+        parent.grid_rowconfigure(1, minsize=200)
 
-        r = 5
-        act = ttk.Frame(right)
-        act.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(10, 0))
-        # 移除“全部去重”按钮，重新分配列权重
-        act.columnconfigure((0, 1, 2, 3), weight=1)
-        ttk.Button(act, text="保存配置", command=self._save).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(act, text="批量导入密钥", command=self._import_keys).grid(row=0, column=1, sticky="ew", padx=4)
-        ttk.Button(act, text="测试全部密钥", command=self._test_keys).grid(row=0, column=2, sticky="ew", padx=4)
-        ttk.Button(act, text="手动恢复密钥", command=self._reset_selected_key).grid(row=0, column=3, sticky="ew", padx=(4, 0))
+        # 左：MCP 配置示例
+        mcp_frame = ctk.CTkFrame(bottom, fg_color=CLR_CARD, corner_radius=8)
+        mcp_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        mcp_frame.grid_columnconfigure(0, weight=1)
+        mcp_frame.grid_rowconfigure(1, weight=1)
 
-        # ---- 底部：左右分栏（左侧为 MCP 示例，右侧为测试日志）
-        bottom_frame = ttk.Frame(outer)
-        bottom_frame.grid(row=3, column=0, sticky="nsew")
-        bottom_frame.columnconfigure(0, weight=1, uniform="bottom_cols") # 左侧 MCP 示例占 1/2 宽度
-        bottom_frame.columnconfigure(1, weight=1, uniform="bottom_cols") # 右侧 测试日志占 1/2 宽度
-        bottom_frame.rowconfigure(0, weight=1)
-        outer.rowconfigure(3, weight=0, minsize=240) # 适当增加底部高度以容纳内容
+        mcp_hdr = ctk.CTkFrame(mcp_frame, fg_color="transparent")
+        mcp_hdr.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
+        ctk.CTkLabel(mcp_hdr, text="📋 MCP 客户端配置示例", font=ctk.CTkFont(size=12, weight="bold"),
+                    text_color=CLR_ACCENT).pack(side="left")
+        ctk.CTkButton(mcp_hdr, text="复制", command=self._copy_mcp_example,
+                     width=60, height=24, fg_color=CLR_ACCENT, hover_color=CLR_HOVER,
+                     font=ctk.CTkFont(size=10)).pack(side="right")
 
-        # 底部左侧：MCP 客户端配置示例
-        mcp_frame = ttk.LabelFrame(bottom_frame, text="MCP 客户端配置示例", padding=12)
-        mcp_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
-        mcp_frame.columnconfigure(0, weight=1)
-        mcp_frame.rowconfigure(0, weight=1)
+        self.mcp_example_text = tk.Text(mcp_frame, height=7, font=("Consolas", 10),
+                                       bg=CLR_ENTRY_BG, fg=CLR_TEXT, relief="flat", bd=0,
+                                       highlightthickness=0, wrap="word", state="disabled")
+        self.mcp_example_text.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
 
-        self.mcp_example_text = tk.Text(mcp_frame, font=FONT_MONO, height=8, wrap="word", relief="solid", bd=1)
-        self.mcp_example_text.grid(row=0, column=0, sticky="nsew")
-        self.mcp_example_text.configure(state="disabled") # 默认只读
+        # 右：测试日志
+        log_frame = ctk.CTkFrame(bottom, fg_color=CLR_CARD, corner_radius=8)
+        log_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        log_frame.grid_columnconfigure(0, weight=1)
+        log_frame.grid_rowconfigure(1, weight=1)
 
-        mcp_btn_row = ttk.Frame(mcp_frame)
-        mcp_btn_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(mcp_btn_row, text="复制配置", command=self._copy_mcp_example, padding=(8, 2)).pack(side="right")
+        log_hdr = ctk.CTkFrame(log_frame, fg_color="transparent")
+        log_hdr.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
+        ctk.CTkLabel(log_hdr, text="📝 测试日志", font=ctk.CTkFont(size=12, weight="bold"),
+                    text_color=CLR_ACCENT).pack(side="left")
+        ctk.CTkButton(log_hdr, text="清空", command=lambda: self._set_text(self.log_text, ""),
+                     width=60, height=24, fg_color=CLR_CARD, hover_color=CLR_HOVER,
+                     border_width=1, border_color=CLR_BORDER,
+                     font=ctk.CTkFont(size=10)).pack(side="right")
 
-        # 底部右侧：测试日志
-        log_frame = ttk.LabelFrame(bottom_frame, text="测试日志", padding=12)
-        log_frame.grid(row=0, column=1, sticky="nsew")
-        log_frame.columnconfigure(0, weight=1)
-        log_frame.rowconfigure(0, weight=1)
+        self.log_text = tk.Text(log_frame, height=7, font=("Consolas", 10),
+                               bg=CLR_ENTRY_BG, fg=CLR_TEXT, relief="flat", bd=0,
+                               highlightthickness=0, wrap="word")
+        self.log_text.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        log_scroll = tk.Scrollbar(log_frame, command=self.log_text.yview,
+                                 bg=CLR_BORDER, activebackground=CLR_HOVER, width=8)
+        log_scroll.grid(row=1, column=1, sticky="ns", pady=(0, 12))
+        self.log_text.config(yscrollcommand=log_scroll.set)
 
-        self.log_text = tk.Text(log_frame, font=FONT_MONO, height=8, wrap="word", relief="solid", bd=1)
-        self.log_text.grid(row=0, column=0, sticky="nsew")
-        scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
-        scroll.grid(row=0, column=1, sticky="ns")
-        self.log_text.configure(yscrollcommand=scroll.set)
-
-        ttk.Button(log_frame, text="清空日志", command=lambda: self._set_text(self.log_text, "")).grid(row=1, column=0, sticky="e", pady=(8, 0))
-
-    # ------------------------------------------------------------------ 数据加载
+    # ── 数据加载 ──────────────────────────────────────────────────────────────
     def _load_gateway(self) -> None:
         gw = self.config.gateway
         self.port_var.set(str(gw.port))
@@ -342,90 +400,17 @@ class GatewayEditor:
         self.key_type_var.set(svc.key_auth.type)
         self.key_param_var.set(svc.key_auth.param)
         self._set_text(self.patterns_text, "\n".join(svc.failure_patterns))
-        
-        # 刷新密钥 Treeview
-        self._refresh_keys_tree(svc)
-        
-        # 刷新 MCP 客户端配置示例
+        self._refresh_keys_list(svc)
         self._refresh_mcp_example(svc)
 
-    # 增加一个本地缓存，避免每次切换服务都同步请求网关导致卡顿
-    _stats_cache = {}
-    _stats_cache_time = 0.0
-
-    def _refresh_keys_tree(self, svc: ServiceConfig) -> None:
-        """刷新密钥 Treeview 列表，并根据状态着色。"""
-        self.keys_tree.delete(*self.keys_tree.get_children())
-        
-        # 优先使用缓存，如果缓存过期（超过 3 秒）则在后台异步更新，不阻塞 UI 线程
-        import time
-        now = time.time()
-        
-        if not self._stats_cache or (now - self._stats_cache_time > 3.0):
-            # 启动后台线程去请求，避免卡顿
-            threading.Thread(target=self._async_fetch_stats, args=(svc,), daemon=True).start()
-            
-        stats = self._stats_cache.get(svc.name, {}).get("keys", {}).get("details", [])
-        stats_map = {item["key"]: item for item in stats if "key" in item}
-
-        for key in svc.keys:
-            status_str = "正常"
-            fails_str = "0"
-            tag = "normal"
-            
-            if key in stats_map:
-                info = stats_map[key]
-                if info.get("is_disabled"):
-                    status_str = "永久禁用"
-                    fails_str = str(info.get("consecutive_fails", 2))
-                    tag = "disabled"
-                elif info.get("cooldown_remaining", 0) > 0:
-                    status_str = f"冷却中 ({int(info['cooldown_remaining'])}s)"
-                    fails_str = str(info.get("consecutive_fails", 1))
-                    tag = "cooling"
-                else:
-                    fails_str = str(info.get("consecutive_fails", 0))
-            
-            # 隐藏密钥中间部分，保护隐私
-            # 主密钥不需要隐藏起来了，直接显示即可，不进行缩略显示
-            display_key = key
-            self.keys_tree.insert("", "end", values=(display_key, status_str, fails_str), tags=(tag,), iid=key)
-
-    def _svc_from_fields(self) -> ServiceConfig:
-        # 从 Treeview 中提取所有密钥
-        # 如果是 display_key，需要还原为真实 key（iid 存的是真实 key）
-        keys = [self.keys_tree.item(item)["iid"] for item in self.keys_tree.get_children()]
-        
-        return ServiceConfig(
-            name=self.svc_name_var.get().strip(),
-            upstream_url=self.svc_url_var.get().strip(),
-            enabled=bool(self.svc_enabled_var.get()),
-            key_auth=KeyAuthConfig(
-                enabled=bool(self.key_enabled_var.get()),
-                type=self.key_type_var.get().strip() or "header",
-                param=self.key_param_var.get().strip(),
-            ),
-            keys=dedupe_keep_order(keys),
-            failure_patterns=split_lines(self.patterns_text.get("1.0", "end")),
-        )
-
-    def _gw_from_fields(self) -> GatewayConfig:
-        key = self.gw_key_var.get().strip()
-        return GatewayConfig(
-            port=int(self.port_var.get().strip()),
-            access_keys=[key] if key else [],
-            key_cooldown_seconds=int(self.cooldown_var.get().strip()),
-            session_ttl_seconds=int(self.ttl_var.get().strip()),
-            max_failover_retries=int(self.retry_var.get().strip()),
-            upstream_timeout_seconds=int(self.timeout_var.get().strip()),
-        )
-
-    # ------------------------------------------------------------------ 列表
     def _refresh_service_list(self, select_index: int | None = None) -> None:
         self.svc_listbox.delete(0, "end")
         for svc in self.config.services:
             prefix = "● " if svc.enabled else "○ "
             self.svc_listbox.insert("end", f"{prefix}{svc.name}")
+            # 着色
+            idx = self.svc_listbox.size() - 1
+            self.svc_listbox.itemconfig(idx, fg=CLR_SUCCESS if svc.enabled else CLR_MUTED)
         if self.config.services:
             if select_index is None or select_index < 0 or select_index >= len(self.config.services):
                 select_index = 0
@@ -438,6 +423,32 @@ class GatewayEditor:
             self.current_index = -1
             self._load_service(ServiceConfig(name="", upstream_url=""))
 
+    def _refresh_keys_list(self, svc: ServiceConfig) -> None:
+        """刷新密钥列表，根据状态着色。"""
+        self.keys_tree.delete(0, "end")
+        # 后台异步拉取状态（不阻塞 UI）
+        if not self._stats_cache or (time.time() - self._stats_cache_time > 3.0):
+            threading.Thread(target=self._async_fetch_stats, args=(svc,), daemon=True).start()
+        stats = self._stats_cache.get(svc.name, {}).get("keys", {}).get("details", [])
+        stats_map = {item["key"]: item for item in stats if "key" in item}
+
+        for key in svc.keys:
+            status_str = "正常"
+            tag_color = CLR_SUCCESS
+            if key in stats_map:
+                info = stats_map[key]
+                if info.get("is_disabled"):
+                    status_str = "永久禁用"
+                    tag_color = CLR_ERROR
+                elif info.get("cooldown_remaining", 0) > 0:
+                    status_str = f"冷却中({int(info['cooldown_remaining'])}s)"
+                    tag_color = CLR_WARN
+            # 截断显示：前8位...后8位
+            display = key if len(key) <= 24 else f"{key[:12]}...{key[-8:]}"
+            self.keys_tree.insert("end", f"  {display}  [{status_str}]")
+            idx = self.keys_tree.size() - 1
+            self.keys_tree.itemconfig(idx, fg=tag_color)
+
     def _on_select(self, _event=None) -> None:
         sel = self.svc_listbox.curselection()
         if not sel:
@@ -447,7 +458,40 @@ class GatewayEditor:
         self.current_index = idx
         self._load_service(self.config.services[idx])
 
-    # ------------------------------------------------------------------ 操作
+    # ── 数据提取 ──────────────────────────────────────────────────────────────
+    def _svc_from_fields(self) -> ServiceConfig:
+        """从界面字段提取当前服务配置。"""
+        # 从 Listbox 的 iid 映射回真实密钥
+        # keys_tree 存的是显示文本，真实密钥存在 config.services 中
+        # 只有在用户通过导入/删除操作时才修改 svc.keys，这里直接读取
+        if 0 <= self.current_index < len(self.config.services):
+            keys = self.config.services[self.current_index].keys
+        else:
+            keys = []
+        return ServiceConfig(
+            name=self.svc_name_var.get().strip(),
+            upstream_url=self.svc_url_var.get().strip(),
+            enabled=bool(self.svc_enabled_var.get()),
+            key_auth=KeyAuthConfig(
+                enabled=bool(self.key_enabled_var.get()),
+                type=self.key_type_var.get().strip() or "header",
+                param=self.key_param_var.get().strip(),
+            ),
+            keys=keys,
+            failure_patterns=split_lines(self.patterns_text.get("1.0", "end")),
+        )
+
+    def _gw_from_fields(self) -> GatewayConfig:
+        key = self.gw_key_var.get().strip()
+        return GatewayConfig(
+            port=int(self.port_var.get().strip() or "8080"),
+            access_keys=[key] if key else [],
+            key_cooldown_seconds=int(self.cooldown_var.get().strip() or "1800"),
+            session_ttl_seconds=int(self.ttl_var.get().strip() or "1800"),
+            max_failover_retries=int(self.retry_var.get().strip() or "3"),
+            upstream_timeout_seconds=int(self.timeout_var.get().strip() or "120"),
+        )
+
     def _apply_current(self, silent: bool = False) -> bool:
         try:
             svc = self._svc_from_fields()
@@ -461,127 +505,50 @@ class GatewayEditor:
         else:
             self.config.services.append(svc)
             self.current_index = len(self.config.services) - 1
-        self._refresh_service_list(select_index=self.current_index)
         return True
 
-    def _add_service(self) -> None:
-        self._apply_current(silent=True)
-        existing = {s.name for s in self.config.services}
-        name = "new-service"
-        i = 1
-        while name in existing:
-            i += 1
-            name = f"new-service-{i}"
-        self.config.services.append(ServiceConfig(name=name, upstream_url="https://example.com/mcp"))
-        self._refresh_service_list(select_index=len(self.config.services) - 1)
-        self._log(f"已添加服务：{name}")
-
-    def _delete_service(self) -> None:
-        if self.current_index < 0:
-            return
-        svc = self.config.services[self.current_index]
-        if not messagebox.askyesno(APP_TITLE, f"确定删除 [{svc.name}]？"):
-            return
-        del self.config.services[self.current_index]
-        self._refresh_service_list(select_index=max(0, self.current_index - 1))
-        self._log(f"已删除服务：{svc.name}")
-
+    # ── 操作 ──────────────────────────────────────────────────────────────────
     def _save(self) -> None:
         if not self._apply_current(silent=True) and self.config.services:
             return
         try:
             self.config.gateway = self._gw_from_fields()
             self.config.validate()
+            # 确保 .env 文件存在（即使为空）
+            env_path = Path(DEFAULT_CONFIG_PATH).parent / ".env"
+            if not env_path.exists():
+                env_path.touch()
             dump_config(self.config, str(CONFIG_PATH))
         except Exception as exc:
             messagebox.showerror(APP_TITLE, f"保存失败：\n{exc}")
+            self._log(f"❌ 保存失败：{exc}")
             return
-        self._log(f"已保存到 {CONFIG_PATH}")
-        messagebox.showinfo(APP_TITLE, "配置已保存")
-
-    def _async_fetch_stats(self, svc: ServiceConfig) -> None:
-        """在后台线程异步获取网关状态，避免卡顿。"""
-        try:
-            import httpx
-            import time
-            with httpx.Client(timeout=1.0) as client:
-                r = client.get(f"http://127.0.0.1:{self.port_var.get()}/stats", headers={"Authorization": f"Bearer {self.gw_key_var.get()}"})
-                if r.status_code == 200:
-                    self._stats_cache = r.json()
-                    self._stats_cache_time = time.time()
-                    # 在主线程中刷新 Treeview
-                    self.root.after(0, lambda: self._refresh_keys_tree_ui_only(svc))
-        except Exception:
-            pass
-
-    def _refresh_keys_tree_ui_only(self, svc: ServiceConfig) -> None:
-        """仅刷新 UI，不发起网络请求。"""
-        self.keys_tree.delete(*self.keys_tree.get_children())
-        stats = self._stats_cache.get(svc.name, {}).get("keys", {}).get("details", [])
-        stats_map = {item["key"]: item for item in stats if "key" in item}
-
-        for key in svc.keys:
-            status_str = "正常"
-            fails_str = "0"
-            tag = "normal"
-            
-            if key in stats_map:
-                info = stats_map[key]
-                if info.get("is_disabled"):
-                    status_str = "永久禁用"
-                    fails_str = str(info.get("consecutive_fails", 2))
-                    tag = "disabled"
-                elif info.get("cooldown_remaining", 0) > 0:
-                    status_str = f"冷却中 ({int(info['cooldown_remaining'])}s)"
-                    fails_str = str(info.get("consecutive_fails", 1))
-                    tag = "cooling"
-                else:
-                    fails_str = str(info.get("consecutive_fails", 0))
-            
-            # 主密钥不需要隐藏起来了，直接显示即可，不进行缩略显示
-            display_key = key
-            self.keys_tree.insert("", "end", values=(display_key, status_str, fails_str), tags=(tag,), iid=key)
+        self._log(f"✅ 已保存到 {CONFIG_PATH}")
 
     def _import_keys(self) -> None:
-        """弹窗批量导入密钥，自动去重。"""
-        dialog = tk.Toplevel(self.root)
+        """弹窗批量导入密钥。"""
+        if self.current_index < 0:
+            messagebox.showwarning(APP_TITLE, "请先选择一个服务")
+            return
+        dialog = ctk.CTkToplevel(self.root)
         dialog.title("批量导入密钥")
-        dialog.geometry("800x560")
-        dialog.minsize(600, 400)
-        dialog.transient(self.root)
+        dialog.geometry("700x500")
+        dialog.minsize(500, 300)
         dialog.grab_set()
+        dialog.configure(fg_color=CLR_BG)
+        dialog.grid_columnconfigure(0, weight=1)
+        dialog.grid_rowconfigure(1, weight=1)
 
-        dialog.columnconfigure(0, weight=1)
-        dialog.rowconfigure(1, weight=1)
+        # 标题
+        ctk.CTkLabel(dialog, text="请输入密钥列表（每行一个，自动去重）:",
+                    font=ctk.CTkFont(size=12, weight="bold"),
+                    text_color=CLR_TEXT).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 8))
 
-        ttk.Label(dialog, text="请输入密钥列表（每行一个，自动去重并过滤空白行）:", font=FONT_BOLD).grid(
-            row=0, column=0, sticky="w", padx=16, pady=(16, 8)
-        )
-
-        text_frame = ttk.Frame(dialog)
-        text_frame.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
-        text_frame.columnconfigure(0, weight=1)
-        text_frame.rowconfigure(0, weight=1)
-
-        text_area = tk.Text(text_frame, font=FONT_MONO, wrap="none", relief="solid", bd=1)
-        text_area.grid(row=0, column=0, sticky="nsew")
-
-        h_scroll = ttk.Scrollbar(text_frame, orient="horizontal", command=text_area.xview)
-        h_scroll.grid(row=1, column=0, sticky="ew")
-        v_scroll = ttk.Scrollbar(text_frame, orient="vertical", command=text_area.yview)
-        v_scroll.grid(row=0, column=1, sticky="ns")
-        text_area.configure(xscrollcommand=h_scroll.set, yscrollcommand=v_scroll.set)
-
-        def _on_paste(event=None):
-            try:
-                clip = dialog.clipboard_get()
-                clip = clip.replace("\r\n", "\n").replace("\r", "\n")
-                text_area.insert("insert", clip)
-            except tk.TclError:
-                pass
-            return "break"
-
-        text_area.bind("<<Paste>>", _on_paste)
+        # 文本框
+        text_area = tk.Text(dialog, font=("Consolas", 11), bg=CLR_ENTRY_BG, fg=CLR_TEXT,
+                           relief="flat", bd=0, highlightthickness=0, wrap="none",
+                           insertbackground=CLR_TEXT)
+        text_area.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
         text_area.focus_set()
 
         def do_import():
@@ -590,51 +557,63 @@ class GatewayEditor:
             if not imported_keys:
                 dialog.destroy()
                 return
-
             svc = self.config.services[self.current_index]
             old_count = len(svc.keys)
-
             svc.keys = dedupe_keep_order(svc.keys + imported_keys)
             new_added = len(svc.keys) - old_count
-
-            self._refresh_keys_tree(svc)
-            self._log(f"批量导入完成：成功导入并新增 {new_added} 个密钥（已自动去重）")
+            self._refresh_keys_list(svc)
+            self._log(f"✅ 批量导入完成：新增 {new_added} 个密钥（已去重）")
             dialog.destroy()
-            messagebox.showinfo(APP_TITLE, f"成功导入并新增 {new_added} 个密钥！\n已自动过滤重复项。")
+            messagebox.showinfo(APP_TITLE, f"成功导入 {new_added} 个新密钥！")
 
-        btn_row = ttk.Frame(dialog)
+        # 按钮
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
         btn_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 16))
-        btn_row.columnconfigure((0, 1), weight=1)
-        ttk.Button(btn_row, text="取消", command=dialog.destroy).grid(row=0, column=0, sticky="e", padx=(0, 8))
-        ttk.Button(btn_row, text="导入", command=do_import).grid(row=0, column=1, sticky="w")
+        ctk.CTkButton(btn_row, text="取消", command=dialog.destroy, width=80,
+                     fg_color=CLR_CARD, hover_color=CLR_HOVER, border_width=1, border_color=CLR_BORDER).pack(side="right", padx=(4, 0))
+        ctk.CTkButton(btn_row, text="导入", command=do_import, width=80,
+                     fg_color=CLR_ACCENT, hover_color=CLR_HOVER).pack(side="right", padx=(0, 4))
 
     def _delete_selected_keys(self) -> None:
-        """删除选中的单个或批量密钥。"""
+        """删除选中的密钥。"""
         if self.current_index < 0:
             return
-        
-        selections = self.keys_tree.selection()
+        selections = self.keys_tree.curselection()
         if not selections:
-            messagebox.showwarning(APP_TITLE, "请先在列表中选择要删除的密钥（支持按住 Ctrl 或 Shift 键多选）")
+            messagebox.showwarning(APP_TITLE, "请先选择要删除的密钥")
             return
-            
         svc = self.config.services[self.current_index]
-        if not messagebox.askyesno(APP_TITLE, f"确定要删除选中的 {len(selections)} 个密钥吗？"):
+        if not messagebox.askyesno(APP_TITLE, f"确定删除选中的 {len(selections)} 个密钥吗？"):
             return
-            
-        # 遍历选中的 iid（iid 存的是真实 key）并从 svc.keys 中移除
-        deleted_count = 0
-        for key_iid in selections:
-            if key_iid in svc.keys:
-                svc.keys.remove(key_iid)
-                deleted_count += 1
-                
-        # 刷新 Treeview
-        self._refresh_keys_tree(svc)
-        self._log(f"已成功删除 {deleted_count} 个密钥，请点击“保存配置”以应用到网关。")
-        messagebox.showinfo(APP_TITLE, f"已成功删除 {deleted_count} 个密钥！\n请记得点击“保存配置”使改动生效。")
+        # 按倒序删除（避免索引偏移）
+        for idx in sorted(selections, reverse=True):
+            if 0 <= idx < len(svc.keys):
+                del svc.keys[idx]
+        self._refresh_keys_list(svc)
+        self._log(f"✅ 已删除 {len(selections)} 个密钥，请保存配置")
+        messagebox.showinfo(APP_TITLE, f"已删除 {len(selections)} 个密钥")
 
-    def _test_keys(self) -> None:
+    def _test_selected_keys(self) -> None:
+        """测试选中的密钥。"""
+        if not self._apply_current(silent=True):
+            return
+        if self.current_index < 0:
+            messagebox.showwarning(APP_TITLE, "没有可测试的服务")
+            return
+        svc = self.config.services[self.current_index]
+        selections = self.keys_tree.curselection()
+        if not selections:
+            messagebox.showwarning(APP_TITLE, "请先选择要测试的密钥")
+            return
+        # 提取选中的密钥
+        selected_keys = [svc.keys[idx] for idx in selections if 0 <= idx < len(svc.keys)]
+        if not selected_keys:
+            messagebox.showwarning(APP_TITLE, "无有效的密钥可测试")
+            return
+        self._run_test(svc, selected_keys)
+
+    def _test_all_keys(self) -> None:
+        """测试全部密钥。"""
         if not self._apply_current(silent=True):
             return
         if self.current_index < 0:
@@ -644,230 +623,113 @@ class GatewayEditor:
         if not svc.keys:
             messagebox.showwarning(APP_TITLE, f"[{svc.name}] 没有密钥可测试")
             return
-            
-        # 1. 视觉反馈：弹窗提示测试已开始，并清空/聚焦到底部日志区
-        self._log(f"开始并发测试 [{svc.name}] 的全部 {len(svc.keys)} 把密钥…")
+        self._run_test(svc, svc.keys)
+
+    def _run_test(self, svc: ServiceConfig, keys: list[str]) -> None:
+        """执行密钥测试（后台线程）。"""
+        self._log(f"🔄 开始并发测试 [{svc.name}] 的 {len(keys)} 把密钥…")
         
-        # 创建一个非阻塞的“测试中”进度提示弹窗
-        progress_dialog = tk.Toplevel(self.root)
+        # 进度弹窗
+        progress_dialog = ctk.CTkToplevel(self.root)
         progress_dialog.title("测试中")
-        progress_dialog.geometry("400x150")
+        progress_dialog.geometry("400x120")
         progress_dialog.resizable(False, False)
-        progress_dialog.transient(self.root)
+        progress_dialog.configure(fg_color=CLR_BG)
         progress_dialog.grab_set()
-        # 居中
-        progress_dialog.geometry(f"+{self.root.winfo_x() + 150}+{self.root.winfo_y() + 150}")
-        
-        label = ttk.Label(progress_dialog, text=f"正在并发测试 [{svc.name}] 的 {len(svc.keys)} 把密钥...\n请稍候，测试完成后会自动关闭此窗口。", font=FONT_BOLD, justify="center")
-        label.pack(expand=True, padx=20, pady=20)
-        
-        # 增加一个不确定进度的进度条，提供动态视觉反馈
-        pb = ttk.Progressbar(progress_dialog, mode="indeterminate", length=300)
-        pb.pack(pady=(0, 20))
-        pb.start(10)
+
+        ctk.CTkLabel(progress_dialog, text=f"正在测试 {len(keys)} 把密钥...",
+                    font=ctk.CTkFont(size=12, weight="bold"),
+                    text_color=CLR_TEXT).pack(expand=True, padx=20, pady=20)
 
         def worker() -> None:
             try:
-                # 显式设置并发数等于密钥总数，实现真正的全密钥并发测试
-                concurrency = len(svc.keys)
-                results = asyncio.run(validate_keys(svc, svc.keys, deep=True, concurrency=concurrency, timeout=45.0))
-                # 测试完成后，在主线程中关闭弹窗并展示结果
+                concurrency = min(len(keys), 5)
+                results = asyncio.run(validate_keys(svc, keys, deep=True, concurrency=concurrency, timeout=45.0))
                 self.root.after(0, lambda: [progress_dialog.destroy(), self._show_results(svc.name, results)])
             except Exception as exc:
-                self.root.after(0, lambda: [progress_dialog.destroy(), self._log(f"测试异常：{exc}"), messagebox.showerror(APP_TITLE, f"测试过程中发生异常：\n{exc}")])
+                self.root.after(0, lambda: [progress_dialog.destroy(), self._log(f"❌ 测试异常：{exc}")])
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _show_results(self, name: str, results) -> None:
-        valid_list = []
-        failed_list = []
-        
+        valid_list, failed_list = [], []
         for r in results:
             icon = {"valid": "✅", "quota_exhausted": "⚠️", "invalid": "❌"}.get(r.status, "💥")
-            # 主密钥不需要隐藏起来了，直接显示即可，不进行缩略显示
-            log_line = f"  {icon} {r.key} | {r.latency_ms}ms | {r.detail}"
-            if r.status == "valid":
-                valid_list.append(log_line)
-            else:
-                failed_list.append(log_line)
-                
-        ok = len(valid_list)
-        failed = len(failed_list)
-        
-        self._log(f"[{name}] 测试完成！共 {len(results)} 把密钥。")
-        self._log(f"--- 整合结果：成功 {ok} 把，失败 {failed} 把 ---")
-        
-        if valid_list:
-            self._log("【成功密钥列表】:")
-            for line in valid_list:
-                self._log(line)
-                
-        if failed_list:
-            self._log("【失败密钥列表】:")
-            for line in failed_list:
-                self._log(line)
-                
-        self._log("----------------------------------------")
-        
-        # 2. 视觉反馈：测试完成后弹出结果汇总弹窗，直接在弹窗中展示完整的成功和失败密钥列表
-        report_lines = [f"[{name}] 测试完成！共 {len(results)} 把密钥。\n"]
-        report_lines.append(f"✅ 成功密钥：{ok} 把")
-        report_lines.append(f"❌ 失败密钥：{failed} 把\n")
-        
-        if valid_list:
-            report_lines.append("【成功密钥列表】:")
-            for line in valid_list:
-                report_lines.append(line)
-            report_lines.append("")
-            
-        if failed_list:
-            report_lines.append("【失败密钥列表】:")
-            for line in failed_list:
-                report_lines.append(line)
-                
-        report_text = "\n".join(report_lines)
-        
-        # 创建一个自定义的滚动文本弹窗，确保能完整展示所有密钥测试结果
-        result_dialog = tk.Toplevel(self.root)
-        result_dialog.title("测试结果报告")
-        result_dialog.geometry("800x500")
-        result_dialog.transient(self.root)
+            line = f"  {icon} {r.key} | {r.latency_ms}ms | {r.detail}"
+            (valid_list if r.status == "valid" else failed_list).append(line)
+
+        ok, failed = len(valid_list), len(failed_list)
+        self._log(f"[{name}] 测试完成：✅ {ok} 把有效，❌ {failed} 把失败")
+        for line in valid_list + failed_list:
+            self._log(line)
+        self._log("─" * 60)
+
+        # 结果弹窗
+        result_dialog = ctk.CTkToplevel(self.root)
+        result_dialog.title("测试结果")
+        result_dialog.geometry("800x480")
+        result_dialog.configure(fg_color=CLR_BG)
         result_dialog.grab_set()
-        result_dialog.geometry(f"+{self.root.winfo_x() + 100}+{self.root.winfo_y() + 100}")
-        
-        ttk.Label(result_dialog, text="密钥并发测试报告汇总:", font=FONT_BOLD).pack(anchor="w", padx=16, pady=(16, 8))
-        
-        text_widget = tk.Text(result_dialog, font=FONT_MONO, wrap="none", relief="solid", bd=1)
-        text_widget.pack(fill="both", expand=True, padx=16, pady=8)
-        
-        # 写入结果并设为只读
-        text_widget.insert("1.0", report_text)
+        result_dialog.grid_columnconfigure(0, weight=1)
+        result_dialog.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(result_dialog, text=f"[{name}] 测试完成：✅ {ok} 把有效  ❌ {failed} 把失败",
+                    font=ctk.CTkFont(size=13, weight="bold"),
+                    text_color=CLR_TEXT).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 8))
+
+        report = "\n".join([f"✅ 有效密钥 ({ok} 把):"] + valid_list +
+                           ["", f"❌ 失败密钥 ({failed} 把):"] + failed_list)
+        text_widget = tk.Text(result_dialog, font=("Consolas", 10), bg=CLR_ENTRY_BG, fg=CLR_TEXT,
+                             relief="flat", bd=0, highlightthickness=0, wrap="none")
+        text_widget.grid(row=1, column=0, sticky="nsew", padx=16, pady=8)
+        text_widget.insert("1.0", report)
         text_widget.configure(state="disabled")
-        
-        # 滚动条
-        scroll_y = ttk.Scrollbar(result_dialog, orient="vertical", command=text_widget.yview)
-        scroll_y.pack(side="right", fill="y")
-        text_widget.configure(yscrollcommand=scroll_y.set)
-        
-        btn_row = ttk.Frame(result_dialog)
-        btn_row.pack(fill="x", padx=16, pady=16)
-        ttk.Button(btn_row, text="确定", command=result_dialog.destroy).pack(side="right")
 
-    def _reset_selected_key(self) -> None:
-        """手动恢复选中的已被禁用的密钥。"""
-        sel = self.keys_tree.selection()
-        if not sel:
-            messagebox.showwarning(APP_TITLE, "请先在列表中选择要恢复的密钥")
-            return
-        
-        key = sel[0]  # iid 就是真实 key
-        svc = self.config.services[self.current_index]
-        
-        # 尝试向运行中的网关发送重置请求（如果网关正在运行）
-        # 我们可以通过在保存配置时，网关如果重启或重新加载配置就会生效。
-        # 另外，我们也可以直接在 GUI 内存中重置，并提示用户保存。
-        # 为了让体验最好，我们直接在本地重置，并提示用户保存。
-        # 此外，如果网关正在运行，我们可以通过向网关发送一个特殊的管理请求，或者直接提示用户保存配置。
-        # 实际上，由于网关在启动时会重新加载配置，所以保存配置并重启网关是最稳妥的。
-        # 我们在本地重置该密钥的状态：
-        self._log(f"已手动恢复密钥: ...{key[-6:]}，请点击“保存配置”以应用到网关。")
-        
-        # 刷新本地显示
-        self._refresh_keys_tree(svc)
-        messagebox.showinfo(APP_TITLE, f"密钥 ...{key[-6:]} 已恢复为正常状态。\n请记得点击“保存配置”使改动生效。")
+        ctk.CTkButton(result_dialog, text="确定", command=result_dialog.destroy,
+                     fg_color=CLR_ACCENT, hover_color=CLR_HOVER).grid(row=2, column=0, sticky="e", padx=16, pady=16)
 
-    def _on_key_double_click(self, event) -> None:
-        """双击密钥进行编辑或添加新密钥。"""
-        sel = self.keys_tree.selection()
-        
-        # 弹窗让用户输入/编辑密钥
-        dialog = tk.Toplevel(self.root)
-        dialog.title("编辑密钥")
-        dialog.geometry("500x180")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        
-        # 居中
-        dialog.geometry(f"+{self.root.winfo_x() + 100}+{self.root.winfo_y() + 100}")
-        
-        ttk.Label(dialog, text="请输入密钥明文:").pack(anchor="w", padx=16, pady=(16, 8))
-        
-        entry_var = tk.StringVar()
-        if sel:
-            # 编辑现有密钥
-            old_key = sel[0]
-            entry_var.set(old_key)
-        
-        entry = ttk.Entry(dialog, textvariable=entry_var, width=50)
-        entry.pack(fill="x", padx=16, pady=8)
-        entry.focus_set()
-        
-        def save_key():
-            new_key = entry_var.get().strip()
-            if not new_key:
-                return
-            
-            svc = self.config.services[self.current_index]
-            if sel:
-                # 替换旧密钥
-                idx = svc.keys.index(old_key)
-                svc.keys[idx] = new_key
-            else:
-                # 添加新密钥
-                if new_key not in svc.keys:
-                    svc.keys.append(new_key)
-            
-            self._refresh_keys_tree(svc)
-            dialog.destroy()
-            
-        btn_row = ttk.Frame(dialog)
-        btn_row.pack(fill="x", padx=16, pady=16)
-        ttk.Button(btn_row, text="确定", command=save_key).pack(side="right", padx=(8, 0))
-        ttk.Button(btn_row, text="取消", command=dialog.destroy).pack(side="right")
+    def _async_fetch_stats(self, svc: ServiceConfig) -> None:
+        """后台线程拉取网关状态。"""
+        try:
+            import httpx
+            with httpx.Client(timeout=1.0) as client:
+                r = client.get(
+                    f"http://127.0.0.1:{self.port_var.get()}/stats",
+                    headers={"Authorization": f"Bearer {self.gw_key_var.get()}"}
+                )
+                if r.status_code == 200:
+                    self._stats_cache = r.json()
+                    self._stats_cache_time = time.time()
+                    self.root.after(0, lambda: self._refresh_keys_list(svc))
+        except Exception:
+            pass
 
-    # ------------------------------------------------------------------ 工具
     def _refresh_mcp_example(self, svc: ServiceConfig) -> None:
         """刷新 MCP 客户端配置示例。"""
-        import json
         port = self.port_var.get().strip() or "8080"
         gw_key = self.gw_key_var.get().strip() or "YOUR_GATEWAY_KEY"
-        
-        # 构造标准的 MCP 客户端配置 JSON 示例
-        # 针对 Streamable HTTP 传输协议，在主流客户端（如 VS Code, Cursor 等）中，
-        # 官方标准且最稳定的配置方式是使用 "type": "streamable-http" 和 "url" 字段。
-        # 注意：由于客户端内部使用标准 URL 相对解析（如 new URL("mcp", url)），
-        # 如果 URL 不以 /mcp 结尾，客户端在解析时会将最后一级路径替换掉（例如 /context7 会被替换解析为 /mcp，导致 401 鉴权失败）。
-        # 因此，配置的 URL 必须显式以 /mcp 结尾（即 http://127.0.0.1:8080/context7/mcp），
-        # 这样无论客户端是直接请求还是进行相对解析，都能 100% 准确路由到网关的 /{service}/{rest:path} 接口。
         example_dict = {
             "mcpServers": {
                 f"gateway-{svc.name}": {
                     "type": "streamable-http",
                     "url": f"http://127.0.0.1:{port}/{svc.name}/mcp",
-                    "headers": {
-                        "Authorization": f"Bearer {gw_key}"
-                    }
+                    "headers": {"Authorization": f"Bearer {gw_key}"}
                 }
             }
         }
-        
         example_json = json.dumps(example_dict, indent=2, ensure_ascii=False)
-        
-        # 写入只读编辑框
         self.mcp_example_text.configure(state="normal")
         self._set_text(self.mcp_example_text, example_json)
         self.mcp_example_text.configure(state="disabled")
 
     def _copy_mcp_example(self) -> None:
-        """复制 MCP 客户端配置示例到剪贴板。"""
         content = self.mcp_example_text.get("1.0", "end-1c")
         if content.strip():
             self.root.clipboard_clear()
             self.root.clipboard_append(content)
-            self._log("已成功复制 MCP 客户端配置示例到剪贴板！")
-            messagebox.showinfo(APP_TITLE, "MCP 客户端配置示例已成功复制到剪贴板！")
+            self._log("✅ 已复制 MCP 客户端配置到剪贴板")
+            messagebox.showinfo(APP_TITLE, "已复制到剪贴板！")
 
-    # ------------------------------------------------------------------ 工具
     def _set_text(self, widget: tk.Text, value: str) -> None:
         widget.delete("1.0", "end")
         widget.insert("1.0", value)
@@ -876,13 +738,42 @@ class GatewayEditor:
         self.log_text.insert("end", msg + "\n")
         self.log_text.see("end")
 
+    def _add_tooltip(self, widget, text: str) -> None:
+        """为组件添加 tooltip（悬停提示）。"""
+        def on_enter(event):
+            tooltip = tk.Toplevel(widget)
+            tooltip.wm_overrideredirect(True)
+            tooltip.wm_geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
+            label = tk.Label(tooltip, text=text, background=CLR_PANEL, foreground=CLR_TEXT,
+                           font=("Microsoft YaHei UI", 9), padx=8, pady=4, relief="solid", bd=1)
+            label.pack()
+            widget.tooltip = tooltip
 
+        def on_leave(event):
+            if hasattr(widget, 'tooltip'):
+                widget.tooltip.destroy()
+                del widget.tooltip
+
+        widget.bind("<Enter>", on_enter)
+        widget.bind("<Leave>", on_leave)
+
+
+# ── 入口 ──────────────────────────────────────────────────────────────────────
 def main() -> None:
-    root = tk.Tk()
-    enable_high_dpi(root)
+    # 在创建窗口前先设置 DPI 感知（不需要 Tk 实例）
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+    root = ctk.CTk()
+    root.configure(fg_color=CLR_BG)
     GatewayEditor(root)
     root.mainloop()
 
 
 if __name__ == "__main__":
     main()
+
