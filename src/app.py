@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import logging
 
 import httpx
@@ -70,6 +71,14 @@ def create_app(config: AppConfig, client: httpx.AsyncClient | None = None) -> St
     async def on_shutdown() -> None:
         if state["owns_client"] and state["client"] is not None:
             await state["client"].aclose()
+
+    @asynccontextmanager
+    async def lifespan(_app: Starlette):
+        await on_startup()
+        try:
+            yield
+        finally:
+            await on_shutdown()
 
     def _check_access(request: Request) -> JSONResponse | None:
         """校验网关访问密钥，通过返回 None，否则返回 401 响应。"""
@@ -134,7 +143,7 @@ def create_app(config: AppConfig, client: httpx.AsyncClient | None = None) -> St
         Route("/{service}/{rest:path}", handle_service, methods=["GET", "POST", "DELETE"]),
     ]
 
-    app = Starlette(routes=routes, on_startup=[on_startup], on_shutdown=[on_shutdown])
+    app = Starlette(routes=routes, lifespan=lifespan)
     # 暴露给测试用
     app.state.config = config
     app.state.runtime = state

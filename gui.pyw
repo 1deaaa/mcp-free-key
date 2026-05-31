@@ -154,17 +154,17 @@ class GatewayEditor:
                      text_color=CLR_TEXT, font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 16))
 
     def _build_body(self, parent) -> None:
-        """中部主体：左侧服务列表（固定宽）+ 右侧编辑区（拉伸）。"""
+        """中部主体：上半区编辑，下半区全宽日志/示例。"""
         body = ctk.CTkFrame(parent, fg_color="transparent")
         body.grid(row=1, column=0, sticky="nsew", padx=16, pady=16)
-        body.grid_columnconfigure(0, weight=0, minsize=200)  # 左侧固定
-        body.grid_columnconfigure(1, weight=1)               # 右侧拉伸
-        body.grid_rowconfigure(0, weight=1)
+        body.grid_columnconfigure(0, weight=0, minsize=200)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=0, minsize=340)
+        body.grid_rowconfigure(1, weight=1)
 
-        # 左侧：服务列表
         self._build_service_list(body)
-        # 右侧：编辑区 + 日志
         self._build_right_panel(body)
+        self._build_log_panel(body)
 
     def _build_service_list(self, parent) -> None:
         """左侧服务列表面板。"""
@@ -195,17 +195,13 @@ class GatewayEditor:
         self.svc_listbox.config(yscrollcommand=scrollbar.set)
 
     def _build_right_panel(self, parent) -> None:
-        """右侧编辑区 + 日志。"""
+        """右侧上半区：服务编辑区。"""
         right = ctk.CTkFrame(parent, fg_color="transparent")
         right.grid(row=0, column=1, sticky="nsew")
         right.grid_columnconfigure(0, weight=1)
         right.grid_rowconfigure(0, weight=1)
-        right.grid_rowconfigure(1, weight=0)
 
-        # 上半部分：编辑区
         self._build_service_editor(right)
-        # 下半部分：日志
-        self._build_log_panel(right)
 
     def _build_service_editor(self, parent) -> None:
         """服务编辑区。"""
@@ -331,13 +327,13 @@ class GatewayEditor:
                      font=ctk.CTkFont(size=11)).grid(row=0, column=4, sticky="ew", padx=(4, 0))
 
     def _build_log_panel(self, parent) -> None:
-        """底部：MCP 示例 + 测试日志（左右分栏）。"""
+        """底部：全宽 MCP 示例 + 测试日志（40/60 分栏）。"""
         bottom = ctk.CTkFrame(parent, fg_color="transparent")
-        bottom.grid(row=1, column=0, sticky="nsew")
-        bottom.grid_columnconfigure(0, weight=1)
-        bottom.grid_columnconfigure(1, weight=1)
+        bottom.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        bottom.grid_columnconfigure(0, weight=2)
+        bottom.grid_columnconfigure(1, weight=3)
         bottom.grid_rowconfigure(0, weight=1)
-        parent.grid_rowconfigure(1, minsize=200)
+        parent.grid_rowconfigure(1, weight=1, minsize=280)
 
         # 左：MCP 配置示例
         mcp_frame = ctk.CTkFrame(bottom, fg_color=CLR_CARD, corner_radius=8)
@@ -785,4 +781,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
