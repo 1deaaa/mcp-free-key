@@ -63,6 +63,14 @@ class ServiceConfig:
         if self.key_auth.enabled and not self.keys:
             raise ValueError(f"服务 [{self.name}] 启用了密钥鉴权但密钥池为空")
 
+    def validate_basic(self) -> None:
+        """基础校验：不检查密钥池是否为空（供 GUI 编辑时使用）。"""
+        if not self.name:
+            raise ValueError("服务缺少 name 字段")
+        if not self.upstream_url:
+            raise ValueError(f"服务 [{self.name}] 缺少 upstream_url 字段")
+        self.key_auth.validate(self.name)
+
     @property
     def normalized_failure_patterns(self) -> list[str]:
         """返回小写化的失败特征，用于大小写不敏感匹配。"""

@@ -495,7 +495,7 @@ class GatewayEditor:
     def _apply_current(self, silent: bool = False) -> bool:
         try:
             svc = self._svc_from_fields()
-            svc.validate()
+            svc.validate_basic()
         except Exception as exc:
             if not silent:
                 messagebox.showerror(APP_TITLE, f"配置不合法：\n{exc}")
@@ -509,15 +509,24 @@ class GatewayEditor:
 
     # ── 操作 ──────────────────────────────────────────────────────────────────
     def _save(self) -> None:
-        if not self._apply_current(silent=True) and self.config.services:
-            return
+        # 1. 同步编辑区字段到 config（允许密钥为空不报错）
+        if 0 <= self.current_index < len(self.config.services):
+            svc = self.config.services[self.current_index]
+            svc.enabled = bool(self.svc_enabled_var.get())
+            svc.failure_patterns = split_lines(self.patterns_text.get("1.0", "end"))
+            svc.key_auth.enabled = bool(self.key_enabled_var.get())
+            svc.key_auth.type = self.key_type_var.get().strip() or "header"
+            svc.key_auth.param = self.key_param_var.get().strip()
+        # 2. 校验网关参数
         try:
             self.config.gateway = self._gw_from_fields()
-            self.config.validate()
-            # 确保 .env 文件存在（即使为空）
-            env_path = Path(DEFAULT_CONFIG_PATH).parent / ".env"
-            if not env_path.exists():
-                env_path.touch()
+            self.config.gateway.validate()
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"网关参数不合法：\n{exc}")
+            self._log(f"❌ 保存失败：{exc}")
+            return
+        # 3. 写入文件
+        try:
             dump_config(self.config, str(CONFIG_PATH))
         except Exception as exc:
             messagebox.showerror(APP_TITLE, f"保存失败：\n{exc}")
