@@ -29,7 +29,8 @@ KEY_LEVEL_HTTP_STATUS = {401, 402, 403, 429}
 class FailureResult:
     """检测结果。"""
 
-    is_failure: bool          # 是否判定为当前密钥失效
+    is_failure: bool          # 是否判定为当前请求失败（需换密钥重试）
+    is_key_failure: bool      # 是否密钥层面失效（需标记冷却/禁用）
     reason: str = ""          # 失败原因描述（用于日志）
 
 
@@ -50,13 +51,13 @@ def detect_failure(
     Returns:
         FailureResult，is_failure 为 True 表示应触发故障转移。
     """
-    # 第 1 层：HTTP 鉴权/限流状态码
+    # 第 1 层：HTTP 鉴权/限流状态码 → 密钥失效
     if status_code in KEY_LEVEL_HTTP_STATUS:
-        return FailureResult(True, f"HTTP 状态码 {status_code} 指示密钥失效/超限")
+        return FailureResult(True, True, f"HTTP 状态码 {status_code} 指示密钥失效/超限")
 
-    # 5xx 视为上游临时故障，也允许换密钥重试（可能是该密钥对应账户的问题）
+    # 5xx → 上游临时故障，触发重试但不惩罚密钥
     if status_code >= 500:
-        return FailureResult(True, f"HTTP 状态码 {status_code} 上游错误")
+        return FailureResult(True, False, f"HTTP 状态码 {status_code} 上游临时故障")
 
     # 第 2 层：JSON-RPC 顶层 error
     messages = parse_json_messages(body_text, content_type)
@@ -67,7 +68,7 @@ def detect_failure(
             emsg = str(err.get("message", "")).lower()
             # 鉴权/限流相关的 JSON-RPC 错误
             if _looks_like_key_error(emsg):
-                return FailureResult(True, f"JSON-RPC error: {err.get('message')}")
+                return FailureResult(True, True, f"JSON-RPC error: {err.get('message')}")
             # 其它带 error 的情况通常是协议/参数错误，不应换密钥（避免无意义重试）
             # 这里不判定为密钥失败，交由正文关键词层兜底
             _ = code
@@ -77,9 +78,9 @@ def detect_failure(
         haystack = body_text.lower()
         for pattern in failure_patterns:
             if pattern and pattern in haystack:
-                return FailureResult(True, f"命中失败特征关键词: '{pattern}'")
+                return FailureResult(True, True, f"命中失败特征关键词: '{pattern}'")
 
-    return FailureResult(False)
+    return FailureResult(False, False)
 
 
 def _looks_like_key_error(message_lower: str) -> bool:

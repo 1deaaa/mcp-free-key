@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 
 @dataclass
@@ -29,8 +30,13 @@ class _KeyState:
     is_disabled: bool = False       # 是否已被永久禁用（连续失败2次）
 
     def is_available(self, now: float) -> bool:
-        """当前时刻是否可用（未在冷却且未被禁用）。"""
+        """当前时刻是否可用。"""
         if self.is_disabled:
+            # 禁用也有 cooldown_until（下月恢复），到期自动解除
+            if now >= self.cooldown_until:
+                self.is_disabled = False
+                self.consecutive_fails = 0
+                return True
             return False
         return now >= self.cooldown_until
 
@@ -48,7 +54,7 @@ class KeyPoolStats:
 class KeyPool:
     """协程安全的密钥池。"""
 
-    def __init__(self, keys: list[str], cooldown_seconds: int = 1800) -> None:
+    def __init__(self, keys: list[str], cooldown_seconds: int = 60) -> None:
         """初始化密钥池。
 
         Args:
@@ -125,9 +131,28 @@ class KeyPool:
                     return state.value
             return None
 
+    @staticmethod
+    def _next_month_utc_timestamp() -> float:
+        """返回下个自然月 00:00 UTC 的 monotonic 时间戳。
+
+        用 wall-clock 算出下月 1 号 00:00 UTC，再换算为 monotonic。
+        """
+        now_wall = datetime.now(timezone.utc)
+        if now_wall.month == 12:
+            next_month = now_wall.replace(year=now_wall.year + 1, month=1, day=1,
+                                          hour=0, minute=0, second=0, microsecond=0)
+        else:
+            next_month = now_wall.replace(month=now_wall.month + 1, day=1,
+                                          hour=0, minute=0, second=0, microsecond=0)
+        delta = (next_month - now_wall).total_seconds()
+        return time.monotonic() + delta
+
     async def mark_failed(self, key: str) -> None:
-        """将指定密钥标记为失效，进入冷却。
-        如果连续失败达到2次，则将其永久禁用。
+        """将指定密钥标记为失效。
+
+        策略：
+        - 首次失败：冷却 60 秒。
+        - 连续第 2 次失败：禁用到下个自然月 00:00 UTC（额度刷新）。
 
         Args:
             key: 失效的密钥明文。
@@ -136,11 +161,13 @@ class KeyPool:
             now = time.monotonic()
             for state in self._states:
                 if state.value == key:
-                    state.cooldown_until = now + self._cooldown
                     state.fail_count += 1
                     state.consecutive_fails += 1
                     if state.consecutive_fails >= 2:
                         state.is_disabled = True
+                        state.cooldown_until = self._next_month_utc_timestamp()
+                    else:
+                        state.cooldown_until = now + self._cooldown
                     break
 
     async def mark_success(self, key: str) -> None:
