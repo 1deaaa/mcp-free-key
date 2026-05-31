@@ -169,16 +169,28 @@ def _load_env_keys() -> dict[str, list[str]]:
     return keys_map
 
 
-def _save_env_keys(gateway_keys: list[str], services_keys: dict[str, list[str]]) -> None:
-    """将密钥保存到本地 .env 文件。"""
+def _save_env_keys(gateway_keys: list[str], services_keys: dict[str, list[str]], gateway_settings: dict | None = None) -> None:
+    """将密钥和网关设置保存到本地 .env 文件。"""
     env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
     lines = []
     
-    # 写入网关统一密钥
     lines.append("# MCP 聚合网关密钥存储")
+    
+    # 写入网关设置
+    if gateway_settings:
+        lines.append("")
+        lines.append("# 网关设置")
+        for k, v in gateway_settings.items():
+            lines.append(f"{k}={v}")
+    
+    # 写入网关统一密钥
+    lines.append("")
+    lines.append("# 网关访问密钥")
     lines.append(f"GATEWAY_ACCESS_KEYS={','.join(gateway_keys)}")
     
     # 写入各服务的密钥
+    lines.append("")
+    lines.append("# 各服务上游密钥池")
     for svc_name, keys in services_keys.items():
         lines.append(f"SERVICE_KEYS_{svc_name}={','.join(keys)}")
         
@@ -208,15 +220,23 @@ def load_config(path: str | None = None, *, strict: bool = True) -> AppConfig:
 
     gw_raw = raw.get("gateway", {}) or {}
     # 优先使用 .env 中的网关密钥，若无则使用 config.yaml 中的（向下兼容）
-    gw_keys = env_keys.get("GATEWAY_ACCESS_KEYS", list(gw_raw.get("access_keys", []) or []))
-    
+    gw_keys_raw = env_keys.get("GATEWAY_ACCESS_KEYS", [])
+    if gw_keys_raw:
+        gw_keys = [k.strip() for k in gw_keys_raw if k.strip()]
+    else:
+        gw_keys = list(gw_raw.get("access_keys", []) or [])
+
+    def _env_int(key: str, default: int) -> int:
+        vals = env_keys.get(key, [])
+        return int(vals[0]) if vals else default
+
     gateway = GatewayConfig(
-        port=int(gw_raw.get("port", 8080)),
+        port=_env_int("GATEWAY_PORT", int(gw_raw.get("port", 8080))),
         access_keys=gw_keys,
-        key_cooldown_seconds=int(gw_raw.get("key_cooldown_seconds", 1800)),
-        session_ttl_seconds=int(gw_raw.get("session_ttl_seconds", 1800)),
-        max_failover_retries=int(gw_raw.get("max_failover_retries", 3)),
-        upstream_timeout_seconds=int(gw_raw.get("upstream_timeout_seconds", 120)),
+        key_cooldown_seconds=_env_int("GATEWAY_KEY_COOLDOWN_SECONDS", int(gw_raw.get("key_cooldown_seconds", 1800))),
+        session_ttl_seconds=_env_int("GATEWAY_SESSION_TTL_SECONDS", int(gw_raw.get("session_ttl_seconds", 1800))),
+        max_failover_retries=_env_int("GATEWAY_MAX_FAILOVER_RETRIES", int(gw_raw.get("max_failover_retries", 3))),
+        upstream_timeout_seconds=_env_int("GATEWAY_UPSTREAM_TIMEOUT_SECONDS", int(gw_raw.get("upstream_timeout_seconds", 120))),
     )
 
     services = []
@@ -235,7 +255,7 @@ def load_config(path: str | None = None, *, strict: bool = True) -> AppConfig:
 
 
 def dump_config(config: AppConfig, path: str | None = None) -> None:
-    """将配置写回 YAML 文件，同时将密钥剥离并保存到本地 .env 文件。
+    """将配置写回 YAML 文件，同时将密钥和网关设置保存到本地 .env 文件。
 
     Args:
         config: 要保存的配置。
@@ -243,19 +263,26 @@ def dump_config(config: AppConfig, path: str | None = None) -> None:
     """
     path = path or DEFAULT_CONFIG_PATH
     
-    # 1. 剥离密钥并保存到 .env
+    # 1. 保存密钥和网关设置到 .env
     services_keys = {svc.name: svc.keys for svc in config.services}
-    _save_env_keys(config.gateway.access_keys, services_keys)
+    gateway_settings = {
+        "GATEWAY_PORT": config.gateway.port,
+        "GATEWAY_KEY_COOLDOWN_SECONDS": config.gateway.key_cooldown_seconds,
+        "GATEWAY_SESSION_TTL_SECONDS": config.gateway.session_ttl_seconds,
+        "GATEWAY_MAX_FAILOVER_RETRIES": config.gateway.max_failover_retries,
+        "GATEWAY_UPSTREAM_TIMEOUT_SECONDS": config.gateway.upstream_timeout_seconds,
+    }
+    _save_env_keys(config.gateway.access_keys, services_keys, gateway_settings)
     
-    # 2. 构造不含密钥的 config.yaml 数据
+    # 2. 构造 config.yaml 数据（保留默认结构，密钥置空）
     clean_services = []
     for svc in config.services:
         svc_dict = asdict(svc)
-        svc_dict["keys"] = [] # 剥离密钥，不存入 config.yaml
+        svc_dict["keys"] = []
         clean_services.append(svc_dict)
         
     gw_dict = asdict(config.gateway)
-    gw_dict["access_keys"] = [] # 剥离密钥，不存入 config.yaml
+    gw_dict["access_keys"] = []
     
     data = {
         "gateway": gw_dict,

@@ -718,7 +718,7 @@ class GatewayEditor:
                 f"gateway-{svc.name}": {
                     "type": "streamable-http",
                     "url": f"http://127.0.0.1:{port}/{svc.name}/mcp",
-                    "headers": {"Authorization": f"Bearer {gw_key}"}
+                    "headers": {"Authorization": gw_key}
                 }
             }
         }
@@ -733,7 +733,6 @@ class GatewayEditor:
             self.root.clipboard_clear()
             self.root.clipboard_append(content)
             self._log("✅ 已复制 MCP 客户端配置到剪贴板")
-            messagebox.showinfo(APP_TITLE, "已复制到剪贴板！")
 
     def _set_text(self, widget: tk.Text, value: str) -> None:
         widget.delete("1.0", "end")
