@@ -39,6 +39,8 @@ def _extract_access_key(request: Request) -> str | None:
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
+    if auth:
+        return auth.strip()
     key = request.query_params.get("key")
     if key:
         return key.strip()
