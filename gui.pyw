@@ -159,8 +159,8 @@ class GatewayEditor:
         body.grid(row=1, column=0, sticky="nsew", padx=16, pady=16)
         body.grid_columnconfigure(0, weight=0, minsize=200)
         body.grid_columnconfigure(1, weight=1)
-        body.grid_rowconfigure(0, weight=0, minsize=340)
-        body.grid_rowconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=3)
+        body.grid_rowconfigure(1, weight=2, minsize=160)
 
         self._build_service_list(body)
         self._build_right_panel(body)
@@ -333,7 +333,7 @@ class GatewayEditor:
         bottom.grid_columnconfigure(0, weight=2)
         bottom.grid_columnconfigure(1, weight=3)
         bottom.grid_rowconfigure(0, weight=1)
-        parent.grid_rowconfigure(1, weight=1, minsize=280)
+        parent.grid_rowconfigure(1, weight=1, minsize=180)
 
         # 左：MCP 配置示例
         mcp_frame = ctk.CTkFrame(bottom, fg_color=CLR_CARD, corner_radius=8)
