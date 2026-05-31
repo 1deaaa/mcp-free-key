@@ -186,7 +186,7 @@ class ProxyEngine:
                     break
             tried.add(key)
 
-            resp, failure = await self._forward_once_detect(
+            resp, failure, is_key = await self._forward_once_detect(
                 runtime, method, base_headers, body, key, client_session_id, extra_path,
             )
             resp.attempts = attempt
@@ -200,8 +200,9 @@ class ProxyEngine:
                     await runtime.sessions.bind(new_sid, key)
                 return resp
 
-            # 失败：标记冷却，继续尝试下一把
-            await pool.mark_failed(key)
+            # 失败：仅密钥层面失效才标记冷却，5xx 等上游临时故障不惩罚密钥
+            if is_key:
+                await pool.mark_failed(key)
             logger.warning(
                 "服务 [%s] 密钥 ...%s 失效（尝试 %d/%d）：%s",
                 svc.name, key[-6:], attempt, max_attempts, failure,
@@ -221,11 +222,13 @@ class ProxyEngine:
         key: str | None,
         client_session_id: str | None,
         extra_path: str,
-    ) -> tuple[ProxyResponse, str | None]:
+    ) -> tuple[ProxyResponse, str | None, bool]:
         """转发一次并做失败检测。
 
         Returns:
-            (ProxyResponse, failure_reason)；failure_reason 为 None 表示成功。
+            (ProxyResponse, failure_reason, is_key_failure)；
+            failure_reason 为 None 表示成功；
+            is_key_failure 为 True 表示密钥本身失效（需标记冷却）。
         """
         svc = runtime.config
         url, req_headers = self._inject_key(svc, base_headers, key, extra_path)
@@ -244,7 +247,7 @@ class ProxyEngine:
                 body=b'{"error":"upstream unreachable"}',
                 used_key_tail=key[-6:] if key else "",
             )
-            return resp, f"网络错误：{type(e).__name__}: {e}"
+            return resp, f"网络错误：{type(e).__name__}: {e}", False
 
         body_bytes = upstream.content
         body_text = self._safe_text(upstream)
@@ -260,7 +263,7 @@ class ProxyEngine:
             body=body_bytes,
             used_key_tail=key[-6:] if key else "",
         )
-        return resp, (fr.reason if fr.is_failure else None)
+        return resp, (fr.reason if fr.is_failure else None), fr.is_key_failure
 
     async def _single_forward(
         self,
@@ -273,7 +276,7 @@ class ProxyEngine:
         extra_path: str,
     ) -> ProxyResponse:
         """单次转发（无故障转移），用于会话粘连或无密钥服务。"""
-        resp, _failure = await self._forward_once_detect(
+        resp, _failure, _is_key = await self._forward_once_detect(
             runtime, method, base_headers, body, key, client_session_id, extra_path,
         )
         # 单次转发也尝试绑定新会话（无密钥服务 key 为 None 时不绑定）

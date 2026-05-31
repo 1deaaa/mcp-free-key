@@ -83,7 +83,7 @@ class GatewayConfig:
 
     port: int = 8080
     access_keys: list[str] = field(default_factory=list)
-    key_cooldown_seconds: int = 1800
+    key_cooldown_seconds: int = 60
     session_ttl_seconds: int = 1800
     max_failover_retries: int = 3
     upstream_timeout_seconds: int = 120
