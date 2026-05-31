@@ -129,6 +129,16 @@ def create_app(config: AppConfig, client: httpx.AsyncClient | None = None) -> St
         """健康检查端点（无需鉴权）。"""
         return JSONResponse({"status": "ok", "services": [s.name for s in config.services]})
 
+    async def handle_well_known(request: Request) -> JSONResponse:
+        """处理 OAuth 发现端点（无需鉴权）。
+
+        MCP 客户端（Cursor/Claude 等）在建立连接前会先探测
+        /.well-known/oauth-protected-resource 和
+        /.well-known/oauth-authorization-server。
+        本网关不使用 OAuth，返回 404 让客户端跳过 OAuth 流程直接发请求。
+        """
+        return JSONResponse({"error": "not_found"}, status_code=404)
+
     async def handle_stats(request: Request) -> JSONResponse:
         """统计端点（需网关密钥）。"""
         denied = _check_access(request)
@@ -139,6 +149,8 @@ def create_app(config: AppConfig, client: httpx.AsyncClient | None = None) -> St
 
     routes = [
         Route("/healthz", handle_health, methods=["GET"]),
+        Route("/.well-known/oauth-protected-resource", handle_well_known, methods=["GET"]),
+        Route("/.well-known/oauth-authorization-server", handle_well_known, methods=["GET"]),
         Route("/stats", handle_stats, methods=["GET"]),
         Route("/{service}", handle_service, methods=["GET", "POST", "DELETE"]),
         # 兼容上游路径带尾随子路径的情况（少数客户端会 POST 到 /{service}/）
