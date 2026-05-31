@@ -8,14 +8,9 @@
 
 进站鉴权：
 - 所有 /{service} 请求必须携带有效的网关访问密钥，方式二选一：
-    * Authorization: Bearer <access_key>
+    * Authorization: <access_key> 或 Authorization: Bearer <access_key>
     * 查询参数 ?key=<access_key>
 - 校验失败返回 401。
-
-设计说明：
-- 代理引擎已将上游响应完整缓冲（实测为一次性 SSE 单事件），
-  因此这里用普通 Response 透传，保留上游的 Content-Type（含 text/event-stream）
-  与原始正文字节，对 MCP 客户端而言与直连上游无差异。
 """
 from __future__ import annotations
 
@@ -48,16 +43,7 @@ def _extract_access_key(request: Request) -> str | None:
 
 
 def create_app(config: AppConfig, client: httpx.AsyncClient | None = None) -> Starlette:
-    """构造 Starlette 应用。
-
-    Args:
-        config: 应用配置。
-        client: 可选注入的 httpx 客户端（测试用 MockTransport）；
-                为 None 时在 startup 阶段创建真实客户端。
-
-    Returns:
-        Starlette 应用实例。
-    """
+    """构造 Starlette 应用。"""
     state: dict = {"engine": None, "client": client, "owns_client": client is None}
     access_keys = set(config.gateway.access_keys)
 
@@ -68,7 +54,8 @@ def create_app(config: AppConfig, client: httpx.AsyncClient | None = None) -> St
                 follow_redirects=True,
             )
         state["engine"] = ProxyEngine(config, state["client"])
-        logger.info("网关已启动，聚合服务：%s", [s.name for s in config.services])
+        logger.info("网关已启动，聚合服务：%s，鉴权密钥数：%d",
+                     [s.name for s in config.services], len(access_keys))
 
     async def on_shutdown() -> None:
         if state["owns_client"] and state["client"] is not None:
@@ -129,16 +116,6 @@ def create_app(config: AppConfig, client: httpx.AsyncClient | None = None) -> St
         """健康检查端点（无需鉴权）。"""
         return JSONResponse({"status": "ok", "services": [s.name for s in config.services]})
 
-    async def handle_well_known(request: Request) -> JSONResponse:
-        """处理 OAuth 发现端点（无需鉴权）。
-
-        MCP 客户端（Cursor/Claude 等）在建立连接前会先探测
-        /.well-known/oauth-protected-resource 和
-        /.well-known/oauth-authorization-server。
-        本网关不使用 OAuth，返回 404 让客户端跳过 OAuth 流程直接发请求。
-        """
-        return JSONResponse({"error": "not_found"}, status_code=404)
-
     async def handle_stats(request: Request) -> JSONResponse:
         """统计端点（需网关密钥）。"""
         denied = _check_access(request)
@@ -147,18 +124,23 @@ def create_app(config: AppConfig, client: httpx.AsyncClient | None = None) -> St
         engine: ProxyEngine = state["engine"]
         return JSONResponse(await engine.stats())
 
+    async def handle_not_found(request: Request) -> JSONResponse:
+        """非服务路径统一返回 404（避免被 /{service} 捕获后返回 401 触发 OAuth）。"""
+        return JSONResponse({"error": "not_found"}, status_code=404)
+
     routes = [
         Route("/healthz", handle_health, methods=["GET"]),
-        Route("/.well-known/oauth-protected-resource", handle_well_known, methods=["GET"]),
-        Route("/.well-known/oauth-authorization-server", handle_well_known, methods=["GET"]),
+        Route("/.well-known/oauth-protected-resource", handle_not_found, methods=["GET"]),
+        Route("/.well-known/oauth-authorization-server", handle_not_found, methods=["GET"]),
+        Route("/register", handle_not_found, methods=["POST"]),
+        Route("/authorize", handle_not_found, methods=["GET", "POST"]),
+        Route("/token", handle_not_found, methods=["POST"]),
         Route("/stats", handle_stats, methods=["GET"]),
         Route("/{service}", handle_service, methods=["GET", "POST", "DELETE"]),
-        # 兼容上游路径带尾随子路径的情况（少数客户端会 POST 到 /{service}/）
         Route("/{service}/{rest:path}", handle_service, methods=["GET", "POST", "DELETE"]),
     ]
 
     app = Starlette(routes=routes, lifespan=lifespan)
-    # 暴露给测试用
     app.state.config = config
     app.state.runtime = state
     return app
