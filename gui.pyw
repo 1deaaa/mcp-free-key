@@ -28,6 +28,8 @@ from src.config import (
     dump_config,
     load_config,
 )
+from src.key_state import KeyStateStore
+from src.providers import UsageSnapshot, get_provider
 from src.validator import validate_keys
 
 # ── 主题 ──────────────────────────────────────────────────────────────────────
@@ -84,6 +86,8 @@ class GatewayEditor:
         # 实例级缓存（避免类变量在多实例间共享）
         self._stats_cache: dict = {}
         self._stats_cache_time: float = 0.0
+        self._usage_cache: dict[tuple[str, str], UsageSnapshot] = {}
+        self.state_store = KeyStateStore()
 
         self.config = load_config(str(CONFIG_PATH), strict=False)
         self.current_index = 0 if self.config.services else -1
@@ -307,7 +311,7 @@ class GatewayEditor:
         # 操作按钮行
         btn_row = ctk.CTkFrame(editor, fg_color="transparent")
         btn_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
-        for i in range(5):
+        for i in range(7):
             btn_row.grid_columnconfigure(i, weight=1)
 
         ctk.CTkButton(btn_row, text="💾 保存配置", command=self._save,
@@ -322,9 +326,15 @@ class GatewayEditor:
         ctk.CTkButton(btn_row, text="🧪 测试全部密钥", command=self._test_all_keys,
                      fg_color="#0284c7", hover_color="#0369a1",
                      font=ctk.CTkFont(size=11)).grid(row=0, column=3, sticky="ew", padx=4)
+        ctk.CTkButton(btn_row, text="📊 查询额度", command=self._query_selected_usage,
+                     fg_color="#0f766e", hover_color="#115e59",
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=4, sticky="ew", padx=4)
+        ctk.CTkButton(btn_row, text="♻️ 恢复状态", command=self._reset_selected_key_states,
+                     fg_color="#166534", hover_color="#15803d",
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=5, sticky="ew", padx=4)
         ctk.CTkButton(btn_row, text="🗑️ 删除选中", command=self._delete_selected_keys,
                      fg_color="#7f1d1d", hover_color="#991b1b",
-                     font=ctk.CTkFont(size=11)).grid(row=0, column=4, sticky="ew", padx=(4, 0))
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=6, sticky="ew", padx=(4, 0))
 
     def _build_log_panel(self, parent) -> None:
         """底部：全宽 MCP 示例 + 测试日志（40/60 分栏）。"""
@@ -427,11 +437,16 @@ class GatewayEditor:
             threading.Thread(target=self._async_fetch_stats, args=(svc,), daemon=True).start()
         stats = self._stats_cache.get(svc.name, {}).get("keys", {}).get("details", [])
         stats_map = {item["key"]: item for item in stats if "key" in item}
+        persisted_map = self.state_store.build_key_map(svc.name, svc.keys)
 
         for key in svc.keys:
             status_str = "正常"
             tag_color = CLR_SUCCESS
-            if key in stats_map:
+            persisted = persisted_map.get(key)
+            if persisted and persisted.get("is_disabled"):
+                status_str = "永久禁用"
+                tag_color = CLR_ERROR
+            elif key in stats_map:
                 info = stats_map[key]
                 if info.get("is_disabled"):
                     status_str = "永久禁用"
@@ -439,6 +454,9 @@ class GatewayEditor:
                 elif info.get("cooldown_remaining", 0) > 0:
                     status_str = f"冷却中({int(info['cooldown_remaining'])}s)"
                     tag_color = CLR_WARN
+            usage = self._usage_cache.get((svc.name, key))
+            if usage and usage.ok and usage.key_remaining is not None and usage.key_limit is not None:
+                status_str = f"{status_str} | 余{usage.key_remaining}/{usage.key_limit}"
             # 截断显示：前8位...后8位
             display = key if len(key) <= 24 else f"{key[:12]}...{key[-8:]}"
             self.keys_tree.insert("end", f"  {display}  [{status_str}]")
@@ -593,10 +611,30 @@ class GatewayEditor:
         # 按倒序删除（避免索引偏移）
         for idx in sorted(selections, reverse=True):
             if 0 <= idx < len(svc.keys):
+                self.state_store.reset_key(svc.name, svc.keys[idx])
+                self._usage_cache.pop((svc.name, svc.keys[idx]), None)
                 del svc.keys[idx]
         self._refresh_keys_list(svc)
         self._log(f"✅ 已删除 {len(selections)} 个密钥，请保存配置")
         messagebox.showinfo(APP_TITLE, f"已删除 {len(selections)} 个密钥")
+
+    def _reset_selected_key_states(self) -> None:
+        """清除选中密钥的本地废弃状态。"""
+        if self.current_index < 0:
+            return
+        selections = self.keys_tree.curselection()
+        if not selections:
+            messagebox.showwarning(APP_TITLE, "请先选择要恢复状态的密钥")
+            return
+        svc = self.config.services[self.current_index]
+        restored = 0
+        for idx in selections:
+            if 0 <= idx < len(svc.keys):
+                self.state_store.reset_key(svc.name, svc.keys[idx])
+                restored += 1
+        self._refresh_keys_list(svc)
+        self._log(f"✅ 已清除 {restored} 个密钥的本地状态")
+        messagebox.showinfo(APP_TITLE, f"已清除 {restored} 个密钥的本地状态")
 
     def _test_selected_keys(self) -> None:
         """测试选中的密钥。"""
@@ -616,6 +654,28 @@ class GatewayEditor:
             messagebox.showwarning(APP_TITLE, "无有效的密钥可测试")
             return
         self._run_test(svc, selected_keys)
+
+    def _query_selected_usage(self) -> None:
+        """查询选中密钥的额度。"""
+        if not self._apply_current(silent=True):
+            return
+        if self.current_index < 0:
+            messagebox.showwarning(APP_TITLE, "没有可查询的服务")
+            return
+        svc = self.config.services[self.current_index]
+        provider = get_provider(svc.name)
+        if provider is None or not provider.supports_usage:
+            messagebox.showwarning(APP_TITLE, f"[{svc.name}] 当前不支持精确额度查询")
+            return
+        selections = self.keys_tree.curselection()
+        if not selections:
+            messagebox.showwarning(APP_TITLE, "请先选择要查询额度的密钥")
+            return
+        selected_keys = [svc.keys[idx] for idx in selections if 0 <= idx < len(svc.keys)]
+        if not selected_keys:
+            messagebox.showwarning(APP_TITLE, "无有效的密钥可查询额度")
+            return
+        self._run_usage_query(svc, provider, selected_keys)
 
     def _test_all_keys(self) -> None:
         """测试全部密钥。"""
@@ -656,6 +716,33 @@ class GatewayEditor:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _run_usage_query(self, svc: ServiceConfig, provider, keys: list[str]) -> None:
+        """后台查询密钥额度。"""
+        self._log(f"🔄 开始查询 [{svc.name}] 的 {len(keys)} 把密钥额度…")
+
+        progress_dialog = ctk.CTkToplevel(self.root)
+        progress_dialog.title("额度查询中")
+        progress_dialog.geometry("420x120")
+        progress_dialog.resizable(False, False)
+        progress_dialog.configure(fg_color=CLR_BG)
+        progress_dialog.grab_set()
+
+        ctk.CTkLabel(progress_dialog, text=f"正在查询 {len(keys)} 把密钥额度...",
+                    font=ctk.CTkFont(size=12, weight="bold"),
+                    text_color=CLR_TEXT).pack(expand=True, padx=20, pady=20)
+
+        def worker() -> None:
+            try:
+                results = asyncio.run(self._fetch_usage_snapshots(provider, keys))
+                self.root.after(
+                    0,
+                    lambda: [progress_dialog.destroy(), self._show_usage_results(svc, results)],
+                )
+            except Exception as exc:
+                self.root.after(0, lambda: [progress_dialog.destroy(), self._log(f"❌ 额度查询异常：{exc}")])
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _show_results(self, name: str, results) -> None:
         valid_list, failed_list = [], []
         for r in results:
@@ -692,6 +779,86 @@ class GatewayEditor:
 
         ctk.CTkButton(result_dialog, text="确定", command=result_dialog.destroy,
                      fg_color=CLR_ACCENT, hover_color=CLR_HOVER).grid(row=2, column=0, sticky="e", padx=16, pady=16)
+
+    async def _fetch_usage_snapshots(self, provider, keys: list[str]) -> list[tuple[str, UsageSnapshot]]:
+        """并发查询额度快照。"""
+        sem = asyncio.Semaphore(min(2, max(1, len(keys))))
+
+        async def _one(key: str) -> tuple[str, UsageSnapshot]:
+            async with sem:
+                snapshot = await provider.fetch_usage(key, timeout=20.0)
+                if snapshot is None:
+                    snapshot = UsageSnapshot(status="error", detail="当前平台未返回额度信息")
+                return key, snapshot
+
+        return await asyncio.gather(*[_one(key) for key in keys])
+
+    def _show_usage_results(self, svc: ServiceConfig, results: list[tuple[str, UsageSnapshot]]) -> None:
+        """展示额度查询结果。"""
+        ok_lines: list[str] = []
+        fail_lines: list[str] = []
+
+        for key, snapshot in results:
+            self._usage_cache[(svc.name, key)] = snapshot
+            line = self._format_usage_line(key, snapshot)
+            if snapshot.ok:
+                ok_lines.append(line)
+            else:
+                fail_lines.append(line)
+            self._log(line)
+
+        self._refresh_keys_list(svc)
+        self._log("─" * 60)
+
+        ok = len(ok_lines)
+        failed = len(fail_lines)
+        title = f"[{svc.name}] 额度查询完成：✅ {ok} 把成功  ❌ {failed} 把失败"
+        self._log(title)
+
+        result_dialog = ctk.CTkToplevel(self.root)
+        result_dialog.title("额度查询结果")
+        result_dialog.geometry("880x480")
+        result_dialog.configure(fg_color=CLR_BG)
+        result_dialog.grab_set()
+        result_dialog.grid_columnconfigure(0, weight=1)
+        result_dialog.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(result_dialog, text=title,
+                    font=ctk.CTkFont(size=13, weight="bold"),
+                    text_color=CLR_TEXT).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 8))
+
+        report = "\n".join(
+            [f"✅ 查询成功 ({ok} 把):"] + ok_lines +
+            ["", f"❌ 查询失败 ({failed} 把):"] + fail_lines
+        )
+        text_widget = tk.Text(result_dialog, font=("Consolas", 10), bg=CLR_ENTRY_BG, fg=CLR_TEXT,
+                             relief="flat", bd=0, highlightthickness=0, wrap="none")
+        text_widget.grid(row=1, column=0, sticky="nsew", padx=16, pady=8)
+        text_widget.insert("1.0", report)
+        text_widget.configure(state="disabled")
+
+        ctk.CTkButton(result_dialog, text="确定", command=result_dialog.destroy,
+                     fg_color=CLR_ACCENT, hover_color=CLR_HOVER).grid(row=2, column=0, sticky="e", padx=16, pady=16)
+
+    def _format_usage_line(self, key: str, snapshot: UsageSnapshot) -> str:
+        """格式化额度查询输出。"""
+        if not snapshot.ok:
+            return f"  ❌ {key} | {snapshot.detail}"
+
+        parts = [f"  📊 {key}"]
+        if snapshot.key_remaining is not None and snapshot.key_limit is not None and snapshot.key_usage is not None:
+            parts.append(f"密钥剩余 {snapshot.key_remaining}/{snapshot.key_limit}（已用 {snapshot.key_usage}）")
+        if snapshot.account_plan:
+            plan_part = f"套餐 {snapshot.account_plan}"
+            if snapshot.account_remaining is not None and snapshot.account_limit is not None and snapshot.account_usage is not None:
+                plan_part += f" 剩余 {snapshot.account_remaining}/{snapshot.account_limit}（已用 {snapshot.account_usage}）"
+            parts.append(plan_part)
+        if snapshot.paygo_usage is not None:
+            if snapshot.paygo_limit is not None:
+                parts.append(f"按量额度剩余 {snapshot.paygo_limit - snapshot.paygo_usage}/{snapshot.paygo_limit}")
+            else:
+                parts.append(f"按量已用 {snapshot.paygo_usage}")
+        return " | ".join(parts)
 
     def _async_fetch_stats(self, svc: ServiceConfig) -> None:
         """后台线程拉取网关状态。"""
