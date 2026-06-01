@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 from .sse import parse_json_messages
@@ -73,6 +74,11 @@ def detect_failure(
             # 这里不判定为密钥失败，交由正文关键词层兜底
             _ = code
 
+        result = msg.get("result")
+        retryable = _extract_retryable_upstream_error(result)
+        if retryable:
+            return FailureResult(True, False, retryable)
+
     # 第 3 层：服务专属失败特征（针对 Tavily 这类 HTTP200 埋错的情况）
     if failure_patterns:
         haystack = body_text.lower()
@@ -95,5 +101,84 @@ def _looks_like_key_error(message_lower: str) -> bool:
         "forbidden",
         "exceeds your plan",
         "usage limit",
+    )
+    return any(ind in message_lower for ind in indicators)
+
+
+def _extract_retryable_upstream_error(result: object) -> str | None:
+    """从工具结果中提取“上游临时错误”信号。"""
+    if not isinstance(result, dict):
+        return None
+
+    candidates: list[tuple[int | None, str]] = []
+
+    sc = result.get("structuredContent")
+    if isinstance(sc, dict):
+        candidates.extend(_collect_status_and_text(sc))
+
+    for item in result.get("content", []) or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "text":
+            continue
+        text = str(item.get("text", "")).strip()
+        if not text:
+            continue
+        candidates.extend(_collect_status_and_text(text))
+
+    for status, text in candidates:
+        if status is not None and status >= 500:
+            return f"上游内部错误（状态 {status}）"
+        if _looks_like_retryable_upstream_error(text.lower()):
+            return f"上游临时错误：{text[:120]}"
+    return None
+
+
+def _collect_status_and_text(value: object) -> list[tuple[int | None, str]]:
+    """从任意节点中递归提取状态码与文本。"""
+    if isinstance(value, dict):
+        status = value.get("status")
+        detail = value.get("detail")
+        error = value.get("error")
+        text = json.dumps(value, ensure_ascii=False)
+        items = [(status if isinstance(status, int) else None, text)]
+        if detail is not None:
+            items.extend(_collect_status_and_text(detail))
+        if error is not None:
+            items.extend(_collect_status_and_text(error))
+        return items
+
+    if isinstance(value, list):
+        items: list[tuple[int | None, str]] = []
+        for item in value:
+            items.extend(_collect_status_and_text(item))
+        return items
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return [(None, text)]
+        return _collect_status_and_text(parsed) + [(None, text)]
+
+    return []
+
+
+def _looks_like_retryable_upstream_error(message_lower: str) -> bool:
+    """判断文本是否更像上游临时错误而不是密钥问题。"""
+    indicators = (
+        "internal error",
+        "internal server error",
+        "server error",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "temporarily unavailable",
+        "upstream error",
+        "try again later",
+        "timeout",
     )
     return any(ind in message_lower for ind in indicators)

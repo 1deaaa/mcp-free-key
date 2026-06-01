@@ -24,6 +24,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from .config import AppConfig
+from .key_state import KeyStateStore
 from .proxy import ProxyEngine, ProxyError
 
 logger = logging.getLogger("mcp_gateway.app")
@@ -42,9 +43,19 @@ def _extract_access_key(request: Request) -> str | None:
     return None
 
 
-def create_app(config: AppConfig, client: httpx.AsyncClient | None = None) -> Starlette:
+def create_app(
+    config: AppConfig,
+    client: httpx.AsyncClient | None = None,
+    *,
+    state_store: KeyStateStore | None = None,
+) -> Starlette:
     """构造 Starlette 应用。"""
-    state: dict = {"engine": None, "client": client, "owns_client": client is None}
+    state: dict = {
+        "engine": None,
+        "client": client,
+        "owns_client": client is None,
+        "key_state_store": state_store or KeyStateStore(),
+    }
     access_keys = set(config.gateway.access_keys)
 
     async def on_startup() -> None:
@@ -53,7 +64,12 @@ def create_app(config: AppConfig, client: httpx.AsyncClient | None = None) -> St
                 timeout=config.gateway.upstream_timeout_seconds,
                 follow_redirects=True,
             )
-        state["engine"] = ProxyEngine(config, state["client"])
+        if state["engine"] is None:
+            state["engine"] = ProxyEngine(
+                config,
+                state["client"],
+                state_store=state["key_state_store"],
+            )
         logger.info("网关已启动，聚合服务：%s，鉴权密钥数：%d",
                      [s.name for s in config.services], len(access_keys))
 
@@ -143,4 +159,10 @@ def create_app(config: AppConfig, client: httpx.AsyncClient | None = None) -> St
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.config = config
     app.state.runtime = state
+    if client is not None:
+        state["engine"] = ProxyEngine(
+            config,
+            client,
+            state_store=state["key_state_store"],
+        )
     return app

@@ -8,9 +8,9 @@
   （Tavily 额度耗尽时 initialize 仍返回 200）。
 - 真正判断「可用且有额度」必须发起一次真实的 tools/call。
 - 因此校验分两级：
-    * 基础校验（auth）：initialize + tools/list，验证密钥被接受。
-    * 深度校验（quota）：再发一次轻量探针工具调用，复用 failure 检测器
-      判断是否额度耗尽 / 失效。
+    * 基础校验（auth）：initialize，验证密钥被接受。
+    * 深度校验（quota）：直接发一次轻量探针 tools/call，复用 failure
+      检测器判断是否额度耗尽 / 失效，尽量减少测试开销。
 - 各服务的探针工具不同，内置 context7 / tavily 预设，
   未知服务可由调用方传入 ProbeSpec，否则只做基础校验。
 """
@@ -18,14 +18,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import uuid
 from dataclasses import dataclass
-from typing import Any
 
 import httpx
 
 from .config import ServiceConfig
 from .failure import detect_failure
+from .providers import ProbeSpec, get_provider
 from .sse import parse_json_messages
 
 
@@ -34,23 +33,6 @@ STATUS_VALID = "valid"            # 有效且有额度
 STATUS_QUOTA = "quota_exhausted"  # 被接受但额度耗尽/受限
 STATUS_INVALID = "invalid"        # 密钥被拒绝（鉴权失败）
 STATUS_ERROR = "error"            # 网络/解析等其它错误
-
-
-@dataclass
-class ProbeSpec:
-    """深度校验时使用的探针工具调用定义。"""
-
-    tool: str                    # 工具名
-    arguments: dict[str, Any]    # 调用参数
-
-
-# 内置探针预设：使用尽量轻量、参数最简的工具调用
-# 注意：Context7 的 resolve-library-id 实测必填参数是 "query"（而非 libraryName）
-DEFAULT_PROBES: dict[str, ProbeSpec] = {
-    "context7": ProbeSpec(tool="resolve-library-id", arguments={"query": "react"}),
-    "tavily": ProbeSpec(tool="tavily_search", arguments={"query": "ping", "max_results": 1}),
-}
-
 
 @dataclass
 class ValidationResult:
@@ -157,20 +139,19 @@ async def validate_key(
             except httpx.HTTPError:
                 pass  # 通知失败不影响校验主流程
 
-            # 2) 基础校验：tools/list
-            tools_body = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
-            r_tools = await client.post(url, headers=sess_headers, json=tools_body)
-            fr_tools = detect_failure(r_tools.status_code, r_tools.headers.get("content-type"), r_tools.text, patterns)
-            if fr_tools.is_failure:
-                return _result(key, STATUS_INVALID, f"tools/list 失败：{fr_tools.reason}", loop, start)
-
             if not deep:
                 return _result(key, STATUS_VALID, "鉴权通过（未做额度校验）", loop, start)
 
-            # 3) 深度校验：发起真实探针工具调用以检测额度
-            probe = probe or DEFAULT_PROBES.get(service.name)
+            # 2) 深度校验：直接发起真实探针工具调用以检测额度
+            provider = get_provider(service.name)
+            probe = probe or (provider.get_probe() if provider is not None else None)
             if probe is None:
-                # 无可用探针，退化为基础校验结果
+                # 无可用探针时，再退回 tools/list 作为基础校验
+                tools_body = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+                r_tools = await client.post(url, headers=sess_headers, json=tools_body)
+                fr_tools = detect_failure(r_tools.status_code, r_tools.headers.get("content-type"), r_tools.text, patterns)
+                if fr_tools.is_failure:
+                    return _result(key, STATUS_INVALID, f"tools/list 失败：{fr_tools.reason}", loop, start)
                 return _result(key, STATUS_VALID, "鉴权通过（无探针，未做额度校验）", loop, start)
 
             call_body = {

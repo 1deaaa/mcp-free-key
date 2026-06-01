@@ -26,6 +26,7 @@ import httpx
 from .config import AppConfig, ServiceConfig
 from .failure import detect_failure
 from .keypool import KeyPool
+from .key_state import KeyStateStore
 from .sessions import SessionStore
 
 logger = logging.getLogger("mcp_gateway.proxy")
@@ -75,7 +76,13 @@ class ProxyError(Exception):
 class ProxyEngine:
     """透明反向代理引擎。"""
 
-    def __init__(self, config: AppConfig, client: httpx.AsyncClient) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        client: httpx.AsyncClient,
+        *,
+        state_store: KeyStateStore | None = None,
+    ) -> None:
         """初始化。
 
         Args:
@@ -84,11 +91,17 @@ class ProxyEngine:
         """
         self._config = config
         self._client = client
+        self._state_store = state_store
         self._runtimes: dict[str, ServiceRuntime] = {}
         for svc in config.services:
             pool = None
             if svc.key_auth.enabled and svc.keys:
-                pool = KeyPool(svc.keys, cooldown_seconds=config.gateway.key_cooldown_seconds)
+                pool = KeyPool(
+                    svc.keys,
+                    cooldown_seconds=config.gateway.key_cooldown_seconds,
+                    service_name=svc.name,
+                    state_store=state_store,
+                )
             self._runtimes[svc.name] = ServiceRuntime(
                 config=svc,
                 pool=pool,
@@ -203,10 +216,15 @@ class ProxyEngine:
             # 失败：仅密钥层面失效才标记冷却，5xx 等上游临时故障不惩罚密钥
             if is_key:
                 await pool.mark_failed(key)
-            logger.warning(
-                "服务 [%s] 密钥 ...%s 失效（尝试 %d/%d）：%s",
-                svc.name, key[-6:], attempt, max_attempts, failure,
-            )
+                logger.warning(
+                    "服务 [%s] 密钥 ...%s 被判定为密钥失败（尝试 %d/%d）：%s",
+                    svc.name, key[-6:], attempt, max_attempts, failure,
+                )
+            else:
+                logger.warning(
+                    "服务 [%s] 上游临时失败，保留密钥 ...%s（尝试 %d/%d）：%s",
+                    svc.name, key[-6:], attempt, max_attempts, failure,
+                )
 
         # 全部尝试失败：返回最后一次上游响应（让客户端看到真实错误）
         if last_resp is not None:

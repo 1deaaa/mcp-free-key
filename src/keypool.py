@@ -15,7 +15,8 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+
+from .key_state import KeyStateStore, next_month_start_epoch
 
 
 @dataclass
@@ -54,7 +55,14 @@ class KeyPoolStats:
 class KeyPool:
     """协程安全的密钥池。"""
 
-    def __init__(self, keys: list[str], cooldown_seconds: int = 60) -> None:
+    def __init__(
+        self,
+        keys: list[str],
+        cooldown_seconds: int = 60,
+        *,
+        service_name: str = "",
+        state_store: KeyStateStore | None = None,
+    ) -> None:
         """初始化密钥池。
 
         Args:
@@ -65,6 +73,8 @@ class KeyPool:
             raise ValueError("密钥池不能为空")
         self._states = [_KeyState(value=k) for k in keys]
         self._cooldown = cooldown_seconds
+        self._service_name = service_name
+        self._state_store = state_store
         self._cursor = 0  # round-robin 游标
         self._lock = asyncio.Lock()
 
@@ -84,6 +94,7 @@ class KeyPool:
             选中的密钥明文。
         """
         async with self._lock:
+            self._sync_persisted_states_locked()
             now = time.monotonic()
             n = len(self._states)
             # 从游标处开始扫描一整圈，寻找可用密钥
@@ -119,6 +130,7 @@ class KeyPool:
         """
         exclude = exclude or set()
         async with self._lock:
+            self._sync_persisted_states_locked()
             now = time.monotonic()
             n = len(self._states)
             for offset in range(n):
@@ -131,33 +143,18 @@ class KeyPool:
                     return state.value
             return None
 
-    @staticmethod
-    def _next_month_utc_timestamp() -> float:
-        """返回下个自然月 00:00 UTC 的 monotonic 时间戳。
-
-        用 wall-clock 算出下月 1 号 00:00 UTC，再换算为 monotonic。
-        """
-        now_wall = datetime.now(timezone.utc)
-        if now_wall.month == 12:
-            next_month = now_wall.replace(year=now_wall.year + 1, month=1, day=1,
-                                          hour=0, minute=0, second=0, microsecond=0)
-        else:
-            next_month = now_wall.replace(month=now_wall.month + 1, day=1,
-                                          hour=0, minute=0, second=0, microsecond=0)
-        delta = (next_month - now_wall).total_seconds()
-        return time.monotonic() + delta
-
     async def mark_failed(self, key: str) -> None:
         """将指定密钥标记为失效。
 
         策略：
         - 首次失败：冷却 60 秒。
-        - 连续第 2 次失败：禁用到下个自然月 00:00 UTC（额度刷新）。
+        - 连续第 2 次失败：禁用到下个自然月 00:00（本地时区）。
 
         Args:
             key: 失效的密钥明文。
         """
         async with self._lock:
+            self._sync_persisted_states_locked()
             now = time.monotonic()
             for state in self._states:
                 if state.value == key:
@@ -165,7 +162,17 @@ class KeyPool:
                     state.consecutive_fails += 1
                     if state.consecutive_fails >= 2:
                         state.is_disabled = True
-                        state.cooldown_until = self._next_month_utc_timestamp()
+                        disabled_until_epoch = next_month_start_epoch()
+                        state.cooldown_until = now + max(0.0, disabled_until_epoch - time.time())
+                        if self._state_store and self._service_name:
+                            self._state_store.set_key_disabled(
+                                self._service_name,
+                                key,
+                                disabled_until_epoch=disabled_until_epoch,
+                                reason="consecutive_key_failures",
+                                fail_count=state.fail_count,
+                                consecutive_fails=state.consecutive_fails,
+                            )
                     else:
                         state.cooldown_until = now + self._cooldown
                     break
@@ -178,11 +185,15 @@ class KeyPool:
             key: 成功的密钥明文。
         """
         async with self._lock:
+            self._sync_persisted_states_locked()
             for state in self._states:
                 if state.value == key:
                     state.cooldown_until = 0.0
                     state.success_count += 1
                     state.consecutive_fails = 0
+                    state.is_disabled = False
+                    if self._state_store and self._service_name:
+                        self._state_store.reset_key(self._service_name, key)
                     break
 
     async def reset_key_state(self, key: str) -> None:
@@ -192,11 +203,14 @@ class KeyPool:
             key: 密钥明文。
         """
         async with self._lock:
+            self._sync_persisted_states_locked()
             for state in self._states:
                 if state.value == key:
                     state.cooldown_until = 0.0
                     state.consecutive_fails = 0
                     state.is_disabled = False
+                    if self._state_store and self._service_name:
+                        self._state_store.reset_key(self._service_name, key)
                     break
 
     async def available_keys(self, exclude: set[str] | None = None) -> list[str]:
@@ -210,6 +224,7 @@ class KeyPool:
         """
         exclude = exclude or set()
         async with self._lock:
+            self._sync_persisted_states_locked()
             now = time.monotonic()
             n = len(self._states)
             result: list[str] = []
@@ -225,6 +240,7 @@ class KeyPool:
     async def stats(self) -> KeyPoolStats:
         """返回密钥池统计快照。"""
         async with self._lock:
+            self._sync_persisted_states_locked()
             now = time.monotonic()
             available = sum(1 for s in self._states if s.is_available(now))
             details = [
@@ -246,3 +262,28 @@ class KeyPool:
                 cooling=len(self._states) - available,
                 details=details,
             )
+
+    def _sync_persisted_states_locked(self) -> None:
+        """将本地持久化的废弃状态同步到内存。"""
+        if not self._state_store or not self._service_name:
+            return
+
+        persisted = self._state_store.get_service_states(
+            self._service_name,
+            [state.value for state in self._states],
+        )
+        now_mono = time.monotonic()
+        now_wall = time.time()
+
+        for state in self._states:
+            stored = persisted.get(state.value)
+            if stored and stored.is_active:
+                remaining = max(0.0, stored.disabled_until_epoch - now_wall)
+                state.is_disabled = True
+                state.cooldown_until = now_mono + remaining
+                state.fail_count = max(state.fail_count, stored.fail_count)
+                state.consecutive_fails = max(state.consecutive_fails, stored.consecutive_fails)
+            elif state.is_disabled:
+                state.is_disabled = False
+                state.cooldown_until = 0.0
+                state.consecutive_fails = 0
