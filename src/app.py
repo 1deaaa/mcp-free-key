@@ -5,6 +5,7 @@
 - POST/GET/DELETE /{service}        转发到对应上游 MCP（如 /context7、/tavily）
 - GET  /healthz                     健康检查
 - GET  /stats                       密钥池与会话统计（需网关密钥）
+- POST /admin/reset-key             重置单把密钥状态（需网关密钥）
 
 进站鉴权：
 - 所有 /{service} 请求必须携带有效的网关访问密钥，方式二选一：
@@ -140,6 +141,34 @@ def create_app(
         engine: ProxyEngine = state["engine"]
         return JSONResponse(await engine.stats())
 
+    async def handle_reset_key(request: Request) -> JSONResponse:
+        """重置单把密钥状态（需网关密钥）。"""
+        denied = _check_access(request)
+        if denied is not None:
+            return denied
+
+        try:
+            payload = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"error": "bad_request", "message": "请求体必须是 JSON"}, status_code=400)
+
+        service_name = str((payload or {}).get("service", "")).strip()
+        key = str((payload or {}).get("key", "")).strip()
+        if not service_name or not key:
+            return JSONResponse(
+                {"error": "bad_request", "message": "缺少 service 或 key"},
+                status_code=400,
+            )
+
+        engine: ProxyEngine = state["engine"]
+        ok = await engine.reset_key_state(service_name, key)
+        if not ok:
+            return JSONResponse(
+                {"error": "not_found", "message": "服务不存在、未启用密钥池或密钥不存在"},
+                status_code=404,
+            )
+        return JSONResponse({"status": "ok", "service": service_name, "key_tail": key[-6:]})
+
     async def handle_not_found(request: Request) -> JSONResponse:
         """非服务路径统一返回 404（避免被 /{service} 捕获后返回 401 触发 OAuth）。"""
         return JSONResponse({"error": "not_found"}, status_code=404)
@@ -152,6 +181,7 @@ def create_app(
         Route("/authorize", handle_not_found, methods=["GET", "POST"]),
         Route("/token", handle_not_found, methods=["POST"]),
         Route("/stats", handle_stats, methods=["GET"]),
+        Route("/admin/reset-key", handle_reset_key, methods=["POST"]),
         Route("/{service}", handle_service, methods=["GET", "POST", "DELETE"]),
         Route("/{service}/{rest:path}", handle_service, methods=["GET", "POST", "DELETE"]),
     ]
