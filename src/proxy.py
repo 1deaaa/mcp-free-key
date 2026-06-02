@@ -386,3 +386,11 @@ class ProxyEngine:
                 }
             out[name] = entry
         return out
+
+    async def reset_key_state(self, service_name: str, key: str) -> bool:
+        """重置某个服务下某把密钥的运行时状态。"""
+        runtime = self._runtimes.get(service_name)
+        if runtime is None or runtime.pool is None:
+            return False
+        await runtime.pool.reset_key_state(key)
+        return True

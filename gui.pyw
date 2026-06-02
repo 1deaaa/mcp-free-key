@@ -630,11 +630,11 @@ class GatewayEditor:
         restored = 0
         for idx in selections:
             if 0 <= idx < len(svc.keys):
-                self.state_store.reset_key(svc.name, svc.keys[idx])
+                self._restore_key_available(svc, svc.keys[idx])
                 restored += 1
         self._refresh_keys_list(svc)
-        self._log(f"✅ 已清除 {restored} 个密钥的本地状态")
-        messagebox.showinfo(APP_TITLE, f"已清除 {restored} 个密钥的本地状态")
+        self._log(f"✅ 已恢复 {restored} 个密钥为可用状态")
+        messagebox.showinfo(APP_TITLE, f"已恢复 {restored} 个密钥为可用状态")
 
     def _test_selected_keys(self) -> None:
         """测试选中的密钥。"""
@@ -745,9 +745,12 @@ class GatewayEditor:
 
     def _show_results(self, name: str, results) -> None:
         valid_list, failed_list = [], []
+        svc = self.config.services[self.current_index] if 0 <= self.current_index < len(self.config.services) else None
         for r in results:
             icon = {"valid": "✅", "quota_exhausted": "⚠️", "invalid": "❌"}.get(r.status, "💥")
             line = f"  {icon} {r.key} | {r.latency_ms}ms | {r.detail}"
+            if r.status == "valid" and svc is not None:
+                self._restore_key_available(svc, r.key)
             (valid_list if r.status == "valid" else failed_list).append(line)
 
         ok, failed = len(valid_list), len(failed_list)
@@ -755,6 +758,8 @@ class GatewayEditor:
         for line in valid_list + failed_list:
             self._log(line)
         self._log("─" * 60)
+        if svc is not None:
+            self._refresh_keys_list(svc)
 
         # 结果弹窗
         result_dialog = ctk.CTkToplevel(self.root)
@@ -908,6 +913,25 @@ class GatewayEditor:
     def _log(self, msg: str) -> None:
         self.log_text.insert("end", msg + "\n")
         self.log_text.see("end")
+
+    def _restore_key_available(self, svc: ServiceConfig, key: str) -> None:
+        """将密钥恢复为可用：清本地状态，并尝试通知运行中网关。"""
+        self.state_store.reset_key(svc.name, key)
+        self._usage_cache.pop((svc.name, key), None)
+        self._stats_cache_time = 0.0
+
+        try:
+            import httpx
+            with httpx.Client(timeout=1.5) as client:
+                resp = client.post(
+                    f"http://127.0.0.1:{self.port_var.get()}/admin/reset-key",
+                    headers={"Authorization": f"Bearer {self.gw_key_var.get()}"},
+                    json={"service": svc.name, "key": key},
+                )
+                if resp.status_code == 200:
+                    return
+        except Exception:
+            pass
 
     def _add_tooltip(self, widget, text: str) -> None:
         """为组件添加 tooltip（悬停提示）。"""
