@@ -87,6 +87,7 @@ class GatewayEditor:
         self._stats_cache: dict = {}
         self._stats_cache_time: float = 0.0
         self._usage_cache: dict[tuple[str, str], UsageSnapshot] = {}
+        self._restored_keys: set[tuple[str, str]] = set()  # (svc_name, key) 近期手动恢复的密钥
         self.state_store = KeyStateStore()
 
         self.config = load_config(str(CONFIG_PATH), strict=False)
@@ -308,10 +309,10 @@ class GatewayEditor:
         patterns_scroll.grid(row=1, column=1, sticky="nse")
         self.patterns_text.config(yscrollcommand=patterns_scroll.set)
 
-        # 操作按钮行
+        # 操作按钮行（两行布局：第一行管理，第二行测试/恢复）
         btn_row = ctk.CTkFrame(editor, fg_color="transparent")
         btn_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
-        for i in range(7):
+        for i in range(8):
             btn_row.grid_columnconfigure(i, weight=1)
 
         ctk.CTkButton(btn_row, text="💾 保存配置", command=self._save,
@@ -329,12 +330,15 @@ class GatewayEditor:
         ctk.CTkButton(btn_row, text="📊 查询额度", command=self._query_selected_usage,
                      fg_color="#0f766e", hover_color="#115e59",
                      font=ctk.CTkFont(size=11)).grid(row=0, column=4, sticky="ew", padx=4)
-        ctk.CTkButton(btn_row, text="♻️ 恢复状态", command=self._reset_selected_key_states,
+        ctk.CTkButton(btn_row, text="♻️ 恢复选中", command=self._reset_selected_key_states,
                      fg_color="#166534", hover_color="#15803d",
                      font=ctk.CTkFont(size=11)).grid(row=0, column=5, sticky="ew", padx=4)
+        ctk.CTkButton(btn_row, text="♻️ 恢复全部失效密钥", command=self._reset_all_disabled_keys,
+                     fg_color="#166534", hover_color="#15803d",
+                     font=ctk.CTkFont(size=11, weight="bold")).grid(row=0, column=6, sticky="ew", padx=4)
         ctk.CTkButton(btn_row, text="🗑️ 删除选中", command=self._delete_selected_keys,
                      fg_color="#7f1d1d", hover_color="#991b1b",
-                     font=ctk.CTkFont(size=11)).grid(row=0, column=6, sticky="ew", padx=(4, 0))
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=7, sticky="ew", padx=(4, 0))
 
     def _build_log_panel(self, parent) -> None:
         """底部：全宽 MCP 示例 + 测试日志（40/60 分栏）。"""
@@ -442,18 +446,22 @@ class GatewayEditor:
         for key in svc.keys:
             status_str = "正常"
             tag_color = CLR_SUCCESS
-            persisted = persisted_map.get(key)
-            if persisted and persisted.get("is_disabled"):
-                status_str = "永久禁用"
-                tag_color = CLR_ERROR
-            elif key in stats_map:
-                info = stats_map[key]
-                if info.get("is_disabled"):
+            if (svc.name, key) in self._restored_keys:
+                if key in stats_map and not stats_map[key].get("is_disabled") and stats_map[key].get("cooldown_remaining", 0) <= 0:
+                    self._restored_keys.discard((svc.name, key))
+            else:
+                persisted = persisted_map.get(key)
+                if persisted and persisted.get("is_disabled"):
                     status_str = "永久禁用"
                     tag_color = CLR_ERROR
-                elif info.get("cooldown_remaining", 0) > 0:
-                    status_str = f"冷却中({int(info['cooldown_remaining'])}s)"
-                    tag_color = CLR_WARN
+                elif key in stats_map:
+                    info = stats_map[key]
+                    if info.get("is_disabled"):
+                        status_str = "永久禁用"
+                        tag_color = CLR_ERROR
+                    elif info.get("cooldown_remaining", 0) > 0:
+                        status_str = f"冷却中({int(info['cooldown_remaining'])}s)"
+                        tag_color = CLR_WARN
             usage = self._usage_cache.get((svc.name, key))
             if usage and usage.ok and usage.key_remaining is not None and usage.key_limit is not None:
                 status_str = f"{status_str} | 余{usage.key_remaining}/{usage.key_limit}"
@@ -613,6 +621,7 @@ class GatewayEditor:
             if 0 <= idx < len(svc.keys):
                 self.state_store.reset_key(svc.name, svc.keys[idx])
                 self._usage_cache.pop((svc.name, svc.keys[idx]), None)
+                self._restored_keys.discard((svc.name, svc.keys[idx]))
                 del svc.keys[idx]
         self._refresh_keys_list(svc)
         self._log(f"✅ 已删除 {len(selections)} 个密钥，请保存配置")
@@ -635,6 +644,45 @@ class GatewayEditor:
         self._refresh_keys_list(svc)
         self._log(f"✅ 已恢复 {restored} 个密钥为可用状态")
         messagebox.showinfo(APP_TITLE, f"已恢复 {restored} 个密钥为可用状态")
+
+    def _reset_all_disabled_keys(self) -> None:
+        """恢复当前服务所有失效（禁用/冷却中）密钥为可用状态。"""
+        if self.current_index < 0:
+            return
+        svc = self.config.services[self.current_index]
+        stats = self._stats_cache.get(svc.name, {}).get("keys", {}).get("details", [])
+        stats_map = {item["key"]: item for item in stats if "key" in item}
+        persisted_map = self.state_store.build_key_map(svc.name, svc.keys)
+
+        disabled_keys: list[str] = []
+        for key in svc.keys:
+            is_disabled = False
+            persisted = persisted_map.get(key)
+            if persisted and persisted.get("is_disabled"):
+                is_disabled = True
+            elif key in stats_map:
+                info = stats_map[key]
+                if info.get("is_disabled") or info.get("cooldown_remaining", 0) > 0:
+                    is_disabled = True
+            if is_disabled:
+                disabled_keys.append(key)
+
+        if not disabled_keys:
+            messagebox.showinfo(APP_TITLE, "当前服务没有失效密钥")
+            return
+
+        if not messagebox.askyesno(
+            APP_TITLE,
+            f"确定恢复全部 {len(disabled_keys)} 把失效密钥为可用状态吗？\n"
+            "（这会清除所有密钥的冷却和禁用状态）",
+        ):
+            return
+
+        for key in disabled_keys:
+            self._restore_key_available(svc, key)
+        self._refresh_keys_list(svc)
+        self._log(f"✅ 已恢复全部 {len(disabled_keys)} 把失效密钥为可用状态")
+        messagebox.showinfo(APP_TITLE, f"已恢复 {len(disabled_keys)} 把失效密钥为可用状态")
 
     def _test_selected_keys(self) -> None:
         """测试选中的密钥。"""
@@ -919,6 +967,7 @@ class GatewayEditor:
         self.state_store.reset_key(svc.name, key)
         self._usage_cache.pop((svc.name, key), None)
         self._stats_cache_time = 0.0
+        self._restored_keys.add((svc.name, key))
 
         try:
             import httpx
