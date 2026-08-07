@@ -64,7 +64,16 @@ def main() -> int:
         config.gateway.port,
         [svc.name for svc in config.services if svc.enabled],
     )
-    uvicorn.run(app, host="0.0.0.0", port=config.gateway.port, log_level=args.log_level)
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=config.gateway.port,
+            log_level=args.log_level,
+        )
+    )
+    app.state.server = server
+    server.run()
     return 0
 
 

@@ -16,6 +16,7 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 
+from .config import DEFAULT_KEY_COOLDOWN_SECONDS
 from .key_state import KeyStateStore, next_month_start_epoch
 
 
@@ -58,7 +59,7 @@ class KeyPool:
     def __init__(
         self,
         keys: list[str],
-        cooldown_seconds: int = 60,
+        cooldown_seconds: int = DEFAULT_KEY_COOLDOWN_SECONDS,
         *,
         service_name: str = "",
         state_store: KeyStateStore | None = None,
@@ -147,7 +148,7 @@ class KeyPool:
         """将指定密钥标记为失效。
 
         策略：
-        - 首次失败：冷却 60 秒。
+        - 首次失败：使用配置的临时冷却时长。
         - 连续第 2 次失败：禁用到下个自然月 00:00（本地时区）。
 
         Args:

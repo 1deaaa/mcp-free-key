@@ -6,6 +6,7 @@
 - GET  /healthz                     健康检查
 - GET  /stats                       密钥池与会话统计（需网关密钥）
 - POST /admin/reset-key             重置单把密钥状态（需网关密钥）
+- POST /admin/restart               请求网关优雅退出（需网关密钥）
 
 进站鉴权：
 - 所有 /{service} 请求必须携带有效的网关访问密钥，方式二选一：
@@ -169,6 +170,21 @@ def create_app(
             )
         return JSONResponse({"status": "ok", "service": service_name, "key_tail": key[-6:]})
 
+    async def handle_restart(request: Request) -> JSONResponse:
+        """请求当前 Uvicorn 网关优雅退出，供 GUI 随后重新启动。"""
+        denied = _check_access(request)
+        if denied is not None:
+            return denied
+
+        server = getattr(request.app.state, "server", None)
+        if server is None:
+            return JSONResponse(
+                {"error": "unavailable", "message": "当前运行方式不支持重启接口"},
+                status_code=503,
+            )
+        server.should_exit = True
+        return JSONResponse({"status": "restarting"})
+
     async def handle_not_found(request: Request) -> JSONResponse:
         """非服务路径统一返回 404（避免被 /{service} 捕获后返回 401 触发 OAuth）。"""
         return JSONResponse({"error": "not_found"}, status_code=404)
@@ -182,6 +198,7 @@ def create_app(
         Route("/token", handle_not_found, methods=["POST"]),
         Route("/stats", handle_stats, methods=["GET"]),
         Route("/admin/reset-key", handle_reset_key, methods=["POST"]),
+        Route("/admin/restart", handle_restart, methods=["POST"]),
         Route("/{service}", handle_service, methods=["GET", "POST", "DELETE"]),
         Route("/{service}/{rest:path}", handle_service, methods=["GET", "POST", "DELETE"]),
     ]

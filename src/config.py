@@ -21,6 +21,10 @@ DEFAULT_CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml"
 )
 
+# Tavily 免费开发环境的官方短时限制为 100 次/分钟，但未规定失败后的等待秒数；
+# 采用 120 秒作为密钥首次失败的默认冷却时间。
+DEFAULT_KEY_COOLDOWN_SECONDS = 120
+
 
 @dataclass
 class KeyAuthConfig:
@@ -83,7 +87,7 @@ class GatewayConfig:
 
     port: int = 8080
     access_keys: list[str] = field(default_factory=list)
-    key_cooldown_seconds: int = 60
+    key_cooldown_seconds: int = DEFAULT_KEY_COOLDOWN_SECONDS
     session_ttl_seconds: int = 1800
     max_failover_retries: int = 3
     upstream_timeout_seconds: int = 120
@@ -233,7 +237,10 @@ def load_config(path: str | None = None, *, strict: bool = True) -> AppConfig:
     gateway = GatewayConfig(
         port=_env_int("GATEWAY_PORT", int(gw_raw.get("port", 8080))),
         access_keys=gw_keys,
-        key_cooldown_seconds=_env_int("GATEWAY_KEY_COOLDOWN_SECONDS", int(gw_raw.get("key_cooldown_seconds", 1800))),
+        key_cooldown_seconds=_env_int(
+            "GATEWAY_KEY_COOLDOWN_SECONDS",
+            int(gw_raw.get("key_cooldown_seconds", DEFAULT_KEY_COOLDOWN_SECONDS)),
+        ),
         session_ttl_seconds=_env_int("GATEWAY_SESSION_TTL_SECONDS", int(gw_raw.get("session_ttl_seconds", 1800))),
         max_failover_retries=_env_int("GATEWAY_MAX_FAILOVER_RETRIES", int(gw_raw.get("max_failover_retries", 3))),
         upstream_timeout_seconds=_env_int("GATEWAY_UPSTREAM_TIMEOUT_SECONDS", int(gw_raw.get("upstream_timeout_seconds", 120))),

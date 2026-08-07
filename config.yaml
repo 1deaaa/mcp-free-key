@@ -1,7 +1,7 @@
 gateway:
   port: 10240
   access_keys: []
-  key_cooldown_seconds: 1800
+  key_cooldown_seconds: 120
   session_ttl_seconds: 1800
   max_failover_retries: 3
   upstream_timeout_seconds: 120
