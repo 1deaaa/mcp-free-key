@@ -170,6 +170,10 @@ class GatewayEditor:
         self.root.minsize(1100, 700)
         self.ui_font_family, self.mono_font_family = _resolve_font_families(root)
         self._server_process: subprocess.Popen | None = None
+        self._suspend_auto_apply = True
+        self._auto_apply_after_id: str | None = None
+        self._auto_apply_generation = 0
+        self._auto_apply_inflight = False
 
         # 实例级缓存（避免类变量在多实例间共享）
         self._stats_cache: dict = {}
@@ -180,10 +184,13 @@ class GatewayEditor:
 
         self.config = load_config(str(CONFIG_PATH), strict=False)
         self.current_index = 0 if self.config.services else -1
+        self._runtime_port = self.config.gateway.port
+        self._runtime_access_key = self.config.gateway.access_keys[0] if self.config.gateway.access_keys else ""
 
         self._build_ui()
         self._load_gateway()
         self._refresh_service_list(select_index=self.current_index)
+        self._suspend_auto_apply = False
 
     def _ui_font(self, size: int, weight: str = "normal") -> ctk.CTkFont:
         """创建使用系统中文字体的 CustomTkinter 字体。"""
@@ -289,6 +296,16 @@ class GatewayEditor:
         )
         mode_combo.pack(side="left", padx=(0, 0))
         self._add_tooltip(mode_combo, "轮询：各密钥均衡使用；主备：优先使用列表第一把可用密钥")
+        for variable in (
+            self.port_var,
+            self.gw_key_var,
+            self.cooldown_var,
+            self.ttl_var,
+            self.retry_var,
+            self.timeout_var,
+            self.routing_mode_var,
+        ):
+            self._watch_variable(variable)
 
     def _lbl_entry(self, parent, label: str, var: ctk.StringVar, width: int = 120) -> None:
         """标签 + 输入框组合（横向排列）。"""
@@ -297,6 +314,39 @@ class GatewayEditor:
         ctk.CTkEntry(parent, textvariable=var, width=width,
                      fg_color=CLR_ENTRY_BG, border_color=CLR_BORDER,
                      text_color=CLR_TEXT, font=self._ui_font(12)).pack(side="left", padx=(0, 16))
+
+    def _watch_variable(self, variable) -> None:
+        """监听配置变量，修改后通过统一防抖入口自动应用。"""
+        variable.trace_add("write", self._on_setting_changed)
+
+    def _on_setting_changed(self, *_args) -> None:
+        """处理输入变量变化，并刷新会随网关设置变化的示例。"""
+        if self._suspend_auto_apply:
+            return
+        self._schedule_auto_apply()
+        if (
+            hasattr(self, "mcp_example_text")
+            and 0 <= self.current_index < len(self.config.services)
+        ):
+            self._refresh_mcp_example(self.config.services[self.current_index])
+
+    def _on_text_setting_changed(self, _event=None):
+        """处理失败特征文本变化。"""
+        self._on_setting_changed()
+
+    def _schedule_auto_apply(self) -> None:
+        """防抖调度配置应用，避免连续输入时重复写文件和重载网关。"""
+        if self._suspend_auto_apply:
+            return
+        self._auto_apply_generation += 1
+        if self._auto_apply_inflight:
+            return
+        if self._auto_apply_after_id is not None:
+            try:
+                self.root.after_cancel(self._auto_apply_after_id)
+            except tk.TclError:
+                pass
+        self._auto_apply_after_id = self.root.after(500, self._auto_apply)
 
     def _build_body(self, parent) -> None:
         """中部主体：上半区编辑，下半区全宽日志/示例。"""
@@ -455,28 +505,43 @@ class GatewayEditor:
                                       bg=CLR_BORDER, activebackground=CLR_HOVER, width=8)
         patterns_scroll.grid(row=1, column=1, sticky="nse")
         self.patterns_text.config(yscrollcommand=patterns_scroll.set)
+        for variable in (
+            self.svc_enabled_var,
+            self.key_enabled_var,
+            self.key_type_var,
+            self.key_param_var,
+        ):
+            self._watch_variable(variable)
+        self.patterns_text.bind("<KeyRelease>", self._on_text_setting_changed, add="+")
+        self.patterns_text.bind("<FocusOut>", self._on_text_setting_changed, add="+")
 
-        # 操作按钮行（两行布局：第一行管理，第二行测试/恢复）
+        # 操作按钮行（所有编辑均自动应用，不提供单独的保存按钮）
         btn_row = ctk.CTkFrame(editor, fg_color="transparent")
         btn_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
         for i in range(5):
             btn_row.grid_columnconfigure(i, weight=1)
 
-        ctk.CTkButton(btn_row, text="💾 保存配置", command=self._save,
-                     fg_color=CLR_ACCENT, hover_color=CLR_HOVER,
-                     font=self._ui_font(11, "bold")).grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 4))
         ctk.CTkButton(btn_row, text="📥 批量导入密钥", command=self._import_keys,
                      fg_color="#0d9488", hover_color="#0f766e",
-                     font=self._ui_font(11, "bold")).grid(row=0, column=1, sticky="ew", padx=4, pady=(0, 4))
+                     font=self._ui_font(11, "bold")).grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 4))
         ctk.CTkButton(btn_row, text="🧪 测试选中密钥", command=self._test_selected_keys,
                      fg_color=CLR_ACCENT2, hover_color="#6d28d9",
-                     font=self._ui_font(11)).grid(row=0, column=2, sticky="ew", padx=4, pady=(0, 4))
+                     font=self._ui_font(11)).grid(row=0, column=1, sticky="ew", padx=4, pady=(0, 4))
         ctk.CTkButton(btn_row, text="🧪 测试全部密钥", command=self._test_all_keys,
                      fg_color="#0284c7", hover_color="#0369a1",
-                     font=self._ui_font(11)).grid(row=0, column=3, sticky="ew", padx=4, pady=(0, 4))
+                     font=self._ui_font(11)).grid(row=0, column=2, sticky="ew", padx=4, pady=(0, 4))
         ctk.CTkButton(btn_row, text="📊 查询额度", command=self._query_selected_usage,
                      fg_color="#0f766e", hover_color="#115e59",
-                     font=self._ui_font(11)).grid(row=0, column=4, sticky="ew", padx=4, pady=(0, 4))
+                     font=self._ui_font(11)).grid(row=0, column=3, sticky="ew", padx=4, pady=(0, 4))
+        self.restart_button = ctk.CTkButton(
+            btn_row,
+            text="🔄 重启服务",
+            command=self._restart_service,
+            fg_color="#b45309",
+            hover_color="#92400e",
+            font=self._ui_font(11, "bold"),
+        )
+        self.restart_button.grid(row=0, column=4, sticky="ew", padx=(4, 0), pady=(0, 4))
         ctk.CTkButton(btn_row, text="♻️ 恢复选中", command=self._reset_selected_key_states,
                      fg_color="#166534", hover_color="#15803d",
                      font=self._ui_font(11)).grid(row=1, column=0, sticky="ew", padx=(0, 4))
@@ -489,15 +554,9 @@ class GatewayEditor:
         ctk.CTkButton(btn_row, text="🗑️ 删除选中", command=self._delete_selected_keys,
                      fg_color="#7f1d1d", hover_color="#991b1b",
                      font=self._ui_font(11)).grid(row=1, column=3, sticky="ew", padx=4)
-        self.restart_button = ctk.CTkButton(
-            btn_row,
-            text="🔄 重启服务",
-            command=self._restart_service,
-            fg_color="#b45309",
-            hover_color="#92400e",
-            font=self._ui_font(11, "bold"),
-        )
-        self.restart_button.grid(row=1, column=4, sticky="ew", padx=(4, 0))
+        ctk.CTkButton(btn_row, text="🗑️ 删除全部密钥", command=self._delete_all_keys,
+                     fg_color="#991b1b", hover_color="#b91c1c",
+                     font=self._ui_font(11, "bold")).grid(row=1, column=4, sticky="ew", padx=(4, 0))
 
     def _build_log_panel(self, parent) -> None:
         """底部：全宽 MCP 示例 + 测试日志（40/60 分栏）。"""
@@ -563,15 +622,20 @@ class GatewayEditor:
         self.routing_mode_var.set(ROUTING_MODE_LABELS.get(gw.routing_mode, "轮询"))
 
     def _load_service(self, svc: ServiceConfig) -> None:
-        self.svc_name_var.set(svc.name)
-        self.svc_enabled_var.set(svc.enabled)
-        self.svc_url_var.set(svc.upstream_url)
-        self.key_enabled_var.set(svc.key_auth.enabled)
-        self.key_type_var.set(svc.key_auth.type)
-        self.key_param_var.set(svc.key_auth.param)
-        self._set_text(self.patterns_text, "\n".join(svc.failure_patterns))
-        self._refresh_keys_list(svc)
-        self._refresh_mcp_example(svc)
+        was_suspended = self._suspend_auto_apply
+        self._suspend_auto_apply = True
+        try:
+            self.svc_name_var.set(svc.name)
+            self.svc_enabled_var.set(svc.enabled)
+            self.svc_url_var.set(svc.upstream_url)
+            self.key_enabled_var.set(svc.key_auth.enabled)
+            self.key_type_var.set(svc.key_auth.type)
+            self.key_param_var.set(svc.key_auth.param)
+            self._set_text(self.patterns_text, "\n".join(svc.failure_patterns))
+            self._refresh_keys_list(svc)
+            self._refresh_mcp_example(svc)
+        finally:
+            self._suspend_auto_apply = was_suspended
 
     def _refresh_service_list(self, select_index: int | None = None) -> None:
         self.svc_listbox.delete(0, "end")
@@ -670,6 +734,9 @@ class GatewayEditor:
         if not sel:
             return
         idx = int(sel[0])
+        if not self._suspend_auto_apply:
+            self._cancel_auto_apply_timer()
+            self._apply_and_queue_runtime(reason="切换服务前的修改")
         self._apply_current(silent=True)
         self.current_index = idx
         self._load_service(self.config.services[idx])
@@ -715,6 +782,8 @@ class GatewayEditor:
         )
 
     def _apply_current(self, silent: bool = False) -> bool:
+        if self.current_index < 0:
+            return True
         try:
             svc = self._svc_from_fields()
             svc.validate_basic()
@@ -730,87 +799,268 @@ class GatewayEditor:
         return True
 
     # ── 操作 ──────────────────────────────────────────────────────────────────
-    def _save(self) -> bool:
-        # 1. 同步编辑区字段到 config（允许密钥为空不报错）
-        if 0 <= self.current_index < len(self.config.services):
-            svc = self.config.services[self.current_index]
-            svc.enabled = bool(self.svc_enabled_var.get())
-            svc.failure_patterns = split_lines(self.patterns_text.get("1.0", "end"))
-            svc.key_auth.enabled = bool(self.key_enabled_var.get())
-            svc.key_auth.type = self.key_type_var.get().strip() or "header"
-            svc.key_auth.param = self.key_param_var.get().strip()
-        # 2. 校验网关参数
+    def _cancel_auto_apply_timer(self) -> None:
+        """取消尚未执行的自动应用定时器。"""
+        if self._auto_apply_after_id is None:
+            return
         try:
-            self.config.gateway = self._gw_from_fields()
-            self.config.gateway.validate()
-        except Exception as exc:
-            messagebox.showerror(APP_TITLE, f"网关参数不合法：\n{exc}")
-            self._log(f"❌ 保存失败：{exc}")
+            self.root.after_cancel(self._auto_apply_after_id)
+        except tk.TclError:
+            pass
+        self._auto_apply_after_id = None
+
+    def _auto_apply(self) -> None:
+        """执行一次防抖后的自动配置应用。"""
+        self._auto_apply_after_id = None
+        if self._auto_apply_inflight:
+            return
+        self._apply_and_queue_runtime(reason="配置修改", generation=self._auto_apply_generation)
+
+    def _prepare_config(self, *, show_errors: bool) -> bool:
+        """同步并校验界面配置，校验通过后才允许写入文件。"""
+        if not self._apply_current(silent=True):
+            if show_errors:
+                messagebox.showerror(APP_TITLE, "当前服务配置不完整，无法应用")
             return False
-        # 3. 写入文件
+        try:
+            gateway = self._gw_from_fields()
+            gateway.validate()
+            self.config.gateway = gateway
+            self.config.validate()
+        except Exception as exc:
+            if show_errors:
+                messagebox.showerror(APP_TITLE, f"配置不合法：\n{exc}")
+            self._log(f"❌ 配置未应用：{exc}")
+            return False
+        return True
+
+    def _write_config(self, *, show_errors: bool) -> bool:
+        """将已经校验通过的配置写入 YAML 和本地密钥文件。"""
         try:
             dump_config(self.config, str(CONFIG_PATH))
         except Exception as exc:
-            messagebox.showerror(APP_TITLE, f"保存失败：\n{exc}")
-            self._log(f"❌ 保存失败：{exc}")
+            if show_errors:
+                messagebox.showerror(APP_TITLE, f"配置写入失败：\n{exc}")
+            self._log(f"❌ 配置写入失败：{exc}")
             return False
-        self._log(f"✅ 已保存到 {CONFIG_PATH}")
         return True
 
-    def _restart_service(self) -> None:
-        """保存当前配置并重启本地网关。"""
-        if not self._save():
-            return
-        try:
-            port = int(self.port_var.get().strip())
-        except ValueError:
-            messagebox.showerror(APP_TITLE, "端口必须是数字，无法重启服务")
-            return
+    def _apply_and_queue_runtime(
+        self,
+        *,
+        reason: str,
+        generation: int | None = None,
+        show_errors: bool = False,
+    ) -> bool:
+        """写入配置并异步通知运行中的网关立即应用。"""
+        if not self._prepare_config(show_errors=show_errors):
+            return False
+        if not self._write_config(show_errors=show_errors):
+            return False
 
-        access_key = self.gw_key_var.get().strip()
-        if not access_key:
-            messagebox.showerror(APP_TITLE, "未设置网关访问密钥，无法重启服务")
+        self._log(f"✅ {reason}已写入配置，正在立即应用…")
+        if generation is None:
+            self._auto_apply_generation += 1
+            generation = self._auto_apply_generation
+        if self._auto_apply_inflight:
+            return True
+        self._auto_apply_inflight = True
+        target_port = self.config.gateway.port
+        target_key = self.config.gateway.access_keys[0]
+        old_port = self._runtime_port
+        old_key = self._runtime_access_key
+        threading.Thread(
+            target=self._apply_runtime_worker,
+            args=(generation, old_port, old_key, target_port, target_key),
+            daemon=True,
+        ).start()
+        return True
+
+    def _apply_runtime_worker(
+        self,
+        generation: int,
+        old_port: int,
+        old_key: str,
+        target_port: int,
+        target_key: str,
+    ) -> None:
+        """在后台热加载配置，必要时重启网关进程。"""
+        try:
+            old_healthy = self._gateway_is_healthy(old_port)
+            target_healthy = self._gateway_is_healthy(target_port)
+
+            if old_healthy and target_port == old_port:
+                ok, error = self._request_gateway_reload(old_port, old_key)
+                if not ok:
+                    raise RuntimeError(error or "网关拒绝热加载配置")
+            elif old_healthy and target_port != old_port:
+                self._stop_running_gateway(old_port, old_key)
+                self._start_and_wait_gateway(target_port)
+            elif target_healthy:
+                ok, error = self._request_gateway_reload(target_port, old_key)
+                if not ok:
+                    raise RuntimeError(error or "目标端口上的网关拒绝热加载配置")
+            else:
+                self._stop_owned_server_process()
+                self._start_and_wait_gateway(target_port)
+
+            self.root.after(0, lambda: self._finish_auto_apply(
+                generation, target_port, target_key, None,
+            ))
+        except Exception as exc:
+            message = str(exc)
+            self.root.after(0, lambda: self._finish_auto_apply(
+                generation, target_port, target_key, message,
+            ))
+
+    def _finish_auto_apply(
+        self,
+        generation: int,
+        target_port: int,
+        target_key: str,
+        error: str | None,
+    ) -> None:
+        """在主线程收尾自动应用，并处理应用期间产生的新修改。"""
+        self._auto_apply_inflight = False
+        if error is None:
+            self._runtime_port = target_port
+            self._runtime_access_key = target_key
+            self._stats_cache_time = 0.0
+            self._log("✅ 配置已立即生效")
+        else:
+            self._log(f"❌ 配置立即应用失败：{error}")
+
+        if generation != self._auto_apply_generation:
+            self._auto_apply_after_id = self.root.after(100, self._auto_apply)
+
+    def _restart_service(self) -> None:
+        """立即写入当前配置并重启本地网关。"""
+        if self._auto_apply_inflight:
+            self._log("⚠️ 当前已有配置正在应用，请稍候再重启")
+            return
+        self._cancel_auto_apply_timer()
+        self._auto_apply_generation += 1
+        if not self._prepare_config(show_errors=True):
+            return
+        if not self._write_config(show_errors=True):
             return
 
         self.restart_button.configure(state="disabled")
         self._log("🔄 正在重启本地网关，请稍候…")
+        self._auto_apply_inflight = True
+        target_port = self.config.gateway.port
+        target_key = self.config.gateway.access_keys[0]
+        generation = self._auto_apply_generation
         threading.Thread(
             target=self._restart_service_worker,
-            args=(port, access_key),
+            args=(generation, self._runtime_port, self._runtime_access_key, target_port, target_key),
             daemon=True,
         ).start()
 
-    def _restart_service_worker(self, port: int, access_key: str) -> None:
+    def _restart_service_worker(
+        self,
+        generation: int,
+        old_port: int,
+        old_key: str,
+        target_port: int,
+        target_key: str,
+    ) -> None:
         """在后台完成网关退出、启动和健康检查。"""
         try:
-            requested, error = self._request_gateway_restart(port, access_key)
-            if error:
-                raise RuntimeError(error)
-            if requested:
-                if not self._wait_for_gateway_down(port, timeout=6.0):
-                    raise RuntimeError("旧网关未能在 6 秒内退出")
+            if self._gateway_is_healthy(old_port):
+                self._stop_running_gateway(old_port, old_key)
             else:
                 self._stop_owned_server_process()
-
-            process = self._start_gateway_process()
-            self._server_process = process
-            if not self._wait_for_gateway_up(port, process, timeout=12.0):
-                exit_code = process.poll()
-                detail = f"进程已退出（退出码 {exit_code}）" if exit_code is not None else "健康检查超时"
-                raise RuntimeError(f"新网关启动失败：{detail}")
-
-            self.root.after(0, lambda: self._log("✅ 网关已重启，配置已生效"))
+            self._start_and_wait_gateway(target_port)
+            self.root.after(0, lambda: self._finish_manual_restart(
+                generation, target_port, target_key, None,
+            ))
         except Exception as exc:
             message = str(exc)
-            self.root.after(
-                0,
-                lambda: [
-                    self._log(f"❌ 重启服务失败：{message}"),
-                    messagebox.showerror(APP_TITLE, f"重启服务失败：\n{message}"),
-                ],
-            )
-        finally:
-            self.root.after(0, lambda: self.restart_button.configure(state="normal"))
+            self.root.after(0, lambda: self._finish_manual_restart(
+                generation, target_port, target_key, message,
+            ))
+
+    def _finish_manual_restart(
+        self,
+        generation: int,
+        target_port: int,
+        target_key: str,
+        error: str | None,
+    ) -> None:
+        """在主线程完成手动重启状态更新。"""
+        self._auto_apply_inflight = False
+        self.restart_button.configure(state="normal")
+        if error is None:
+            self._runtime_port = target_port
+            self._runtime_access_key = target_key
+            self._stats_cache_time = 0.0
+            self._log("✅ 网关已重启，配置已生效")
+        else:
+            self._log(f"❌ 重启服务失败：{error}")
+            messagebox.showerror(APP_TITLE, f"重启服务失败：\n{error}")
+        if generation != self._auto_apply_generation:
+            self._auto_apply_after_id = self.root.after(100, self._auto_apply)
+
+    def _stop_running_gateway(self, port: int, access_key: str) -> None:
+        """请求运行中的新版本网关优雅退出，并等待端口释放。"""
+        requested, error = self._request_gateway_restart(port, access_key)
+        if error:
+            raise RuntimeError(error)
+        if requested:
+            if not self._wait_for_gateway_down(port, timeout=6.0):
+                raise RuntimeError("旧网关未能在 6 秒内退出")
+            return
+        if self._gateway_is_healthy(port):
+            raise RuntimeError("网关健康检查通过，但无法请求其优雅退出")
+        self._stop_owned_server_process()
+
+    def _start_and_wait_gateway(self, port: int) -> None:
+        """启动网关并等待健康检查通过。"""
+        process = self._start_gateway_process()
+        self._server_process = process
+        if self._wait_for_gateway_up(port, process, timeout=12.0):
+            return
+        exit_code = process.poll()
+        if exit_code is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2.0)
+        self._server_process = None
+        detail = f"进程已退出（退出码 {exit_code}）" if exit_code is not None else "健康检查超时"
+        raise RuntimeError(f"新网关启动失败：{detail}")
+
+    def _request_gateway_reload(
+        self,
+        port: int,
+        access_key: str,
+    ) -> tuple[bool, str | None]:
+        """请求运行中的网关重新读取配置。"""
+        import httpx
+
+        if not access_key:
+            return False, "未设置网关访问密钥，无法热加载配置"
+        try:
+            with httpx.Client(timeout=2.0) as client:
+                response = client.post(
+                    f"http://127.0.0.1:{port}/admin/reload",
+                    headers={"Authorization": f"Bearer {access_key}"},
+                )
+        except httpx.RequestError as exc:
+            return False, f"无法连接网关：{exc}"
+
+        if response.status_code == 200:
+            return True, None
+        if response.status_code == 401:
+            return False, "网关访问密钥不正确，无法热加载配置"
+        try:
+            detail = response.json().get("message", response.text)
+        except ValueError:
+            detail = response.text
+        return False, f"网关拒绝热加载：HTTP {response.status_code} {detail}".strip()
 
     def _request_gateway_restart(
         self,
@@ -832,7 +1082,7 @@ class GatewayEditor:
         if response.status_code == 200:
             return True, None
         if response.status_code == 404:
-            return False, "当前网关不支持重启接口，请先手动重启一次网关进程"
+            return False, "当前网关不支持优雅重启接口，请先启动最新网关程序"
         if response.status_code == 401:
             return False, "网关访问密钥不正确，无法重启服务"
         try:
@@ -974,9 +1224,15 @@ class GatewayEditor:
             svc.keys = dedupe_keep_order(svc.keys + imported_keys)
             new_added = len(svc.keys) - old_count
             self._refresh_keys_list(svc)
+            applied = True
+            if new_added:
+                applied = self._apply_and_queue_runtime(reason="导入密钥")
             self._log(f"✅ 批量导入完成：新增 {new_added} 个密钥（已去重）")
             dialog.destroy()
-            messagebox.showinfo(APP_TITLE, f"成功导入 {new_added} 个新密钥！")
+            if applied:
+                messagebox.showinfo(APP_TITLE, f"成功导入 {new_added} 个新密钥！")
+            else:
+                messagebox.showwarning(APP_TITLE, "密钥已加入当前编辑区，但配置尚未应用，请先修正无效设置")
 
         # 按钮
         btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
@@ -1064,8 +1320,41 @@ class GatewayEditor:
                 self._restored_keys.discard((svc.name, svc.keys[idx]))
                 del svc.keys[idx]
         self._refresh_keys_list(svc)
-        self._log(f"✅ 已删除 {len(selections)} 个密钥，请保存配置")
-        messagebox.showinfo(APP_TITLE, f"已删除 {len(selections)} 个密钥")
+        applied = self._apply_and_queue_runtime(reason="删除选中密钥")
+        self._log(f"✅ 已删除 {len(selections)} 个密钥")
+        if applied:
+            messagebox.showinfo(APP_TITLE, f"已删除 {len(selections)} 个密钥")
+        else:
+            messagebox.showwarning(APP_TITLE, "密钥已从当前编辑区删除，但配置尚未应用，请先修正无效设置")
+
+    def _delete_all_keys(self) -> None:
+        """删除当前服务的全部上游密钥，并立即应用配置。"""
+        if self.current_index < 0:
+            return
+        svc = self.config.services[self.current_index]
+        if not svc.keys:
+            messagebox.showinfo(APP_TITLE, "当前服务没有可删除的密钥")
+            return
+        if not messagebox.askyesno(
+            APP_TITLE,
+            f"确定删除当前服务的全部 {len(svc.keys)} 把密钥吗？\n此操作会立即生效。",
+        ):
+            return
+
+        for key in svc.keys:
+            self.state_store.reset_key(svc.name, key)
+            self._usage_cache.pop((svc.name, key), None)
+            self._restored_keys.discard((svc.name, key))
+        deleted = len(svc.keys)
+        svc.keys = []
+        self._stats_cache_time = 0.0
+        self._refresh_keys_list(svc)
+        applied = self._apply_and_queue_runtime(reason="删除全部密钥")
+        self._log(f"✅ 已删除当前服务全部 {deleted} 个密钥")
+        if applied:
+            messagebox.showinfo(APP_TITLE, f"已删除全部 {deleted} 个密钥")
+        else:
+            messagebox.showwarning(APP_TITLE, "密钥已从当前编辑区删除，但配置尚未应用，请先修正无效设置")
 
     def _reset_selected_key_states(self) -> None:
         """清除选中密钥的本地废弃状态。"""
@@ -1372,8 +1661,8 @@ class GatewayEditor:
             import httpx
             with httpx.Client(timeout=1.0) as client:
                 r = client.get(
-                    f"http://127.0.0.1:{self.port_var.get()}/stats",
-                    headers={"Authorization": f"Bearer {self.gw_key_var.get()}"}
+                    f"http://127.0.0.1:{self._runtime_port}/stats",
+                    headers={"Authorization": f"Bearer {self._runtime_access_key}"}
                 )
                 if r.status_code == 200:
                     self._stats_cache = r.json()
@@ -1426,8 +1715,8 @@ class GatewayEditor:
             import httpx
             with httpx.Client(timeout=1.5) as client:
                 resp = client.post(
-                    f"http://127.0.0.1:{self.port_var.get()}/admin/reset-key",
-                    headers={"Authorization": f"Bearer {self.gw_key_var.get()}"},
+                    f"http://127.0.0.1:{self._runtime_port}/admin/reset-key",
+                    headers={"Authorization": f"Bearer {self._runtime_access_key}"},
                     json={"service": svc.name, "key": key},
                 )
                 if resp.status_code == 200:

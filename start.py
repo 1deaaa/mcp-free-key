@@ -58,7 +58,7 @@ def main() -> int:
         logging.getLogger("mcp_gateway.start").error("加载配置失败：%s", exc)
         return 1
 
-    app = create_app(config)
+    app = create_app(config, config_path=args.config)
     logging.getLogger("mcp_gateway.start").info(
         "启动网关：0.0.0.0:%s，服务=%s",
         config.gateway.port,

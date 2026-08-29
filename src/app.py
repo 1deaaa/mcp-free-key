@@ -6,6 +6,7 @@
 - GET  /healthz                     健康检查
 - GET  /stats                       密钥池与会话统计（需网关密钥）
 - POST /admin/reset-key             重置单把密钥状态（需网关密钥）
+- POST /admin/reload                重新读取配置并立即应用（需网关密钥）
 - POST /admin/restart               请求网关优雅退出（需网关密钥）
 
 进站鉴权：
@@ -26,7 +27,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from .config import AppConfig
+from .config import AppConfig, load_config
 from .key_state import KeyStateStore
 from .proxy import ProxyEngine, ProxyError
 
@@ -51,26 +52,31 @@ def create_app(
     client: httpx.AsyncClient | None = None,
     *,
     state_store: KeyStateStore | None = None,
+    config_path: str | None = None,
 ) -> Starlette:
     """构造 Starlette 应用。"""
     state: dict = {
+        "config": config,
+        "config_path": config_path,
         "engine": None,
         "client": client,
         "owns_client": client is None,
         "key_state_store": state_store or KeyStateStore(),
         "retest_task": None,
+        "reload_lock": asyncio.Lock(),
+        "access_keys": set(config.gateway.access_keys),
     }
-    access_keys = set(config.gateway.access_keys)
 
     async def on_startup() -> None:
+        runtime_config: AppConfig = state["config"]
         if state["client"] is None:
             state["client"] = httpx.AsyncClient(
-                timeout=config.gateway.upstream_timeout_seconds,
+                timeout=runtime_config.gateway.upstream_timeout_seconds,
                 follow_redirects=True,
             )
         if state["engine"] is None:
             state["engine"] = ProxyEngine(
-                config,
+                runtime_config,
                 state["client"],
                 state_store=state["key_state_store"],
             )
@@ -79,7 +85,9 @@ def create_app(
             """周期性领取冷却到期密钥并执行自动复测。"""
             while True:
                 try:
-                    await state["engine"].retest_expired_keys()
+                    engine: ProxyEngine | None = state.get("engine")
+                    if engine is not None:
+                        await engine.retest_expired_keys()
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -88,7 +96,8 @@ def create_app(
 
         state["retest_task"] = asyncio.create_task(retest_loop())
         logger.info("网关已启动，聚合服务：%s，鉴权密钥数：%d",
-                     [s.name for s in config.services], len(access_keys))
+                     [s.name for s in runtime_config.services],
+                     len(state["access_keys"]))
 
     async def on_shutdown() -> None:
         task = state.get("retest_task")
@@ -111,7 +120,7 @@ def create_app(
     def _check_access(request: Request) -> JSONResponse | None:
         """校验网关访问密钥，通过返回 None，否则返回 401 响应。"""
         provided = _extract_access_key(request)
-        if provided is None or provided not in access_keys:
+        if provided is None or provided not in state["access_keys"]:
             return JSONResponse(
                 {"error": "unauthorized", "message": "缺少或无效的网关访问密钥"},
                 status_code=401,
@@ -153,7 +162,8 @@ def create_app(
 
     async def handle_health(request: Request) -> JSONResponse:
         """健康检查端点（无需鉴权）。"""
-        return JSONResponse({"status": "ok", "services": [s.name for s in config.services]})
+        runtime_config: AppConfig = state["config"]
+        return JSONResponse({"status": "ok", "services": [s.name for s in runtime_config.services]})
 
     async def handle_stats(request: Request) -> JSONResponse:
         """统计端点（需网关密钥）。"""
@@ -191,6 +201,60 @@ def create_app(
             )
         return JSONResponse({"status": "ok", "service": service_name, "key_tail": key[-6:]})
 
+    async def handle_reload(request: Request) -> JSONResponse:
+        """从配置文件重新加载网关配置，并在当前进程中立即替换运行时。"""
+        denied = _check_access(request)
+        if denied is not None:
+            return denied
+
+        path = state.get("config_path")
+        if not path:
+            return JSONResponse(
+                {"error": "unavailable", "message": "当前运行方式未提供配置文件路径"},
+                status_code=503,
+            )
+
+        async with state["reload_lock"]:
+            current_config: AppConfig = state["config"]
+            try:
+                new_config = load_config(path)
+            except Exception as exc:  # noqa: BLE001 - 将配置错误返回给 GUI
+                logger.warning("重新加载配置失败：%s", exc)
+                return JSONResponse(
+                    {"error": "bad_config", "message": f"配置无效：{exc}"},
+                    status_code=400,
+                )
+
+            if new_config.gateway.port != current_config.gateway.port:
+                return JSONResponse(
+                    {
+                        "error": "restart_required",
+                        "message": "端口发生变化，请重启网关后应用",
+                        "current_port": current_config.gateway.port,
+                        "requested_port": new_config.gateway.port,
+                    },
+                    status_code=409,
+                )
+
+            new_engine = ProxyEngine(
+                new_config,
+                state["client"],
+                state_store=state["key_state_store"],
+            )
+            state["config"] = new_config
+            state["engine"] = new_engine
+            state["access_keys"] = set(new_config.gateway.access_keys)
+            request.app.state.config = new_config
+
+        logger.info("配置已热加载，服务：%s", [s.name for s in new_config.services])
+        return JSONResponse(
+            {
+                "status": "reloaded",
+                "port": new_config.gateway.port,
+                "services": [s.name for s in new_config.services],
+            }
+        )
+
     async def handle_restart(request: Request) -> JSONResponse:
         """请求当前 Uvicorn 网关优雅退出，供 GUI 随后重新启动。"""
         denied = _check_access(request)
@@ -219,6 +283,7 @@ def create_app(
         Route("/token", handle_not_found, methods=["POST"]),
         Route("/stats", handle_stats, methods=["GET"]),
         Route("/admin/reset-key", handle_reset_key, methods=["POST"]),
+        Route("/admin/reload", handle_reload, methods=["POST"]),
         Route("/admin/restart", handle_restart, methods=["POST"]),
         Route("/{service}", handle_service, methods=["GET", "POST", "DELETE"]),
         Route("/{service}/{rest:path}", handle_service, methods=["GET", "POST", "DELETE"]),

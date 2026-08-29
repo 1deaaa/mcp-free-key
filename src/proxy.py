@@ -144,6 +144,8 @@ class ProxyEngine:
             raise ProxyError(404, f"服务不存在或已禁用：{service_name}")
 
         svc = runtime.config
+        if svc.key_auth.enabled and not svc.keys:
+            raise ProxyError(503, f"服务 [{service_name}] 的密钥池为空，请先添加上游密钥")
         base_headers = self._build_forward_headers(headers)
 
         # 无需密钥鉴权：直接单次转发
@@ -264,7 +266,11 @@ class ProxyEngine:
 
         try:
             upstream = await self._client.request(
-                method, url, headers=req_headers, content=body,
+                method,
+                url,
+                headers=req_headers,
+                content=body,
+                timeout=float(self._config.gateway.upstream_timeout_seconds),
             )
         except httpx.HTTPError as e:
             # 网络层错误也视为该密钥本次失败，允许故障转移
@@ -448,6 +454,11 @@ class ProxyEngine:
                 }
                 entry["routing_mode"] = rt.pool.routing_mode
                 entry["primary_key_tail"] = await rt.pool.primary_key_tail()
+            elif rt.config.key_auth.enabled:
+                # 允许 GUI 暂时清空密钥池，但不能因此退化为无密钥转发。
+                entry["keys"] = {"total": 0, "available": 0, "cooling": 0, "details": []}
+                entry["routing_mode"] = self._config.gateway.routing_mode
+                entry["primary_key_tail"] = ""
             out[name] = entry
         return out
 
