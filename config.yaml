@@ -28,7 +28,4 @@ services:
     param: tavilyApiKey
   keys: []
   failure_patterns:
-  - exceeds your plan
-  - usage limit
-  - upgrade your plan
-  - unauthorized
+  - invalid

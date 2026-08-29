@@ -45,6 +45,24 @@ CONFIG_PATH = Path(DEFAULT_CONFIG_PATH)
 PROJECT_ROOT = CONFIG_PATH.parent
 START_SCRIPT = PROJECT_ROOT / "start.py"
 
+
+def _gateway_python_candidates() -> tuple[Path, ...]:
+    """按项目虚拟环境、当前解释器的顺序返回网关启动解释器。"""
+    if sys.platform == "win32":
+        venv_python = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+    else:
+        venv_python = PROJECT_ROOT / ".venv" / "bin" / "python"
+
+    candidates = [venv_python, Path(sys.executable)]
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        absolute = str(candidate.absolute())
+        if absolute not in seen:
+            seen.add(absolute)
+            unique.append(Path(absolute))
+    return tuple(unique)
+
 # 颜色常量
 CLR_BG       = "#1a1a2e"
 CLR_PANEL    = "#16213e"
@@ -730,6 +748,8 @@ class GatewayEditor:
         if not START_SCRIPT.exists():
             raise FileNotFoundError(f"启动脚本不存在：{START_SCRIPT}")
 
+        gateway_python = self._resolve_gateway_python()
+
         kwargs = {
             "cwd": str(PROJECT_ROOT),
             "stdin": subprocess.DEVNULL,
@@ -737,8 +757,43 @@ class GatewayEditor:
         if sys.platform == "win32":
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         return subprocess.Popen(
-            [sys.executable, str(START_SCRIPT), "--config", str(CONFIG_PATH)],
+            [str(gateway_python), str(START_SCRIPT), "--config", str(CONFIG_PATH)],
             **kwargs,
+        )
+
+    def _resolve_gateway_python(self) -> Path:
+        """选择能够导入网关运行依赖的 Python 解释器。"""
+        probe = "import httpx, starlette, uvicorn, yaml"
+        failures: list[str] = []
+        for candidate in _gateway_python_candidates():
+            if not candidate.is_file():
+                failures.append(f"{candidate}：文件不存在")
+                continue
+            try:
+                result = subprocess.run(
+                    [str(candidate), "-c", probe],
+                    cwd=str(PROJECT_ROOT),
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                failures.append(f"{candidate}：{exc}")
+                continue
+            if result.returncode == 0:
+                return candidate
+            detail = (result.stderr or result.stdout).strip().splitlines()
+            failures.append(f"{candidate}：{detail[-1] if detail else '网关依赖检查失败'}")
+
+        requirements_path = PROJECT_ROOT / "requirements.txt"
+        details = "\n".join(f"- {failure}" for failure in failures)
+        raise RuntimeError(
+            "没有可用的网关 Python 解释器：\n"
+            f"{details}\n"
+            "请先安装项目依赖：\n"
+            f"{_gateway_python_candidates()[0]} -m pip install -r {requirements_path}"
         )
 
     def _stop_owned_server_process(self) -> None:
@@ -988,7 +1043,7 @@ class GatewayEditor:
             try:
                 concurrency = min(len(keys), 5)
                 results = asyncio.run(validate_keys(svc, keys, deep=True, concurrency=concurrency, timeout=45.0))
-                self.root.after(0, lambda: [progress_dialog.destroy(), self._show_results(svc.name, results)])
+                self.root.after(0, lambda: [progress_dialog.destroy(), self._show_results(svc, results)])
             except Exception as exc:
                 self.root.after(0, lambda: [progress_dialog.destroy(), self._log(f"❌ 测试异常：{exc}")])
 
@@ -1021,22 +1076,29 @@ class GatewayEditor:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _show_results(self, name: str, results) -> None:
+    def _show_results(self, svc: ServiceConfig, results) -> None:
+        """展示手动测试结果，并同步更新密钥状态。"""
+        name = svc.name
         valid_list, failed_list = [], []
-        svc = self.config.services[self.current_index] if 0 <= self.current_index < len(self.config.services) else None
+        disabled_count = 0
         for r in results:
             icon = {"valid": "✅", "quota_exhausted": "⚠️", "invalid": "❌"}.get(r.status, "💥")
             line = f"  {icon} {r.key} | {r.latency_ms}ms | {r.detail}"
-            if r.status == "valid" and svc is not None:
+            if r.status == "valid":
                 self._restore_key_available(svc, r.key)
+            else:
+                self._disable_key_after_manual_test(svc, r)
+                disabled_count += 1
             (valid_list if r.status == "valid" else failed_list).append(line)
 
         ok, failed = len(valid_list), len(failed_list)
         self._log(f"[{name}] 测试完成：✅ {ok} 把有效，❌ {failed} 把失败")
         for line in valid_list + failed_list:
             self._log(line)
+        if disabled_count:
+            self._log(f"⚠️ 已自动禁用 {disabled_count} 把测试失败的密钥，可手动恢复")
         self._log("─" * 60)
-        if svc is not None:
+        if 0 <= self.current_index < len(self.config.services) and self.config.services[self.current_index] is svc:
             self._refresh_keys_list(svc)
 
         # 结果弹窗
@@ -1213,6 +1275,17 @@ class GatewayEditor:
                     return
         except Exception:
             pass
+
+    def _disable_key_after_manual_test(self, svc: ServiceConfig, result) -> None:
+        """将手动测试失败的密钥禁用到下个自然月。"""
+        self.state_store.disable_key_until_next_month(
+            svc.name,
+            result.key,
+            reason=f"manual_test_failed:{result.status}",
+        )
+        self._restored_keys.discard((svc.name, result.key))
+        self._usage_cache.pop((svc.name, result.key), None)
+        self._stats_cache_time = 0.0
 
     def _add_tooltip(self, widget, text: str) -> None:
         """为组件添加 tooltip（悬停提示）。"""

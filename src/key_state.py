@@ -119,6 +119,23 @@ class KeyStateStore:
         }
         self._save(data)
 
+    def disable_key_until_next_month(
+        self,
+        service_name: str,
+        key: str,
+        *,
+        reason: str,
+    ) -> None:
+        """将密钥禁用到下个自然月，供手动测试等明确失败场景使用。"""
+        self.set_key_disabled(
+            service_name,
+            key,
+            disabled_until_epoch=next_month_start_epoch(),
+            reason=reason,
+            fail_count=1,
+            consecutive_fails=1,
+        )
+
     def reset_key(self, service_name: str, key: str) -> None:
         """清除某把密钥的持久化状态。"""
         data = self._load()
