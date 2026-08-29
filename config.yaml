@@ -5,6 +5,7 @@ gateway:
   session_ttl_seconds: 1800
   max_failover_retries: 3
   upstream_timeout_seconds: 120
+  routing_mode: round_robin
 services:
 - name: context7
   upstream_url: https://mcp.context7.com/mcp
@@ -28,4 +29,13 @@ services:
     param: tavilyApiKey
   keys: []
   failure_patterns:
-  - invalid
+  - '401'
+  - '429'
+  - '432'
+  - '433'
+  - missing or invalid api key
+  - excessive requests
+  - exceeds your plan's set usage limit
+  - exceeds the pay-as-you-go limit
+  - upgrade your plan
+  - usage limit

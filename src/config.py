@@ -24,6 +24,34 @@ DEFAULT_CONFIG_PATH = os.path.join(
 # Tavily 免费开发环境的官方短时限制为 100 次/分钟，但未规定失败后的等待秒数；
 # 采用 120 秒作为密钥首次失败的默认冷却时间。
 DEFAULT_KEY_COOLDOWN_SECONDS = 120
+DEFAULT_MAX_FAILOVER_RETRIES = 1
+ROUTING_MODE_ROUND_ROBIN = "round_robin"
+ROUTING_MODE_PRIMARY_BACKUP = "primary_backup"
+ROUTING_MODES = (ROUTING_MODE_ROUND_ROBIN, ROUTING_MODE_PRIMARY_BACKUP)
+
+DEFAULT_FAILURE_PATTERNS: dict[str, tuple[str, ...]] = {
+    "context7": (
+        "401",
+        "403",
+        "429",
+        "unauthorized",
+        "invalid api key",
+        "rate limit",
+        "quota",
+    ),
+    "tavily": (
+        "401",
+        "429",
+        "432",
+        "433",
+        "missing or invalid api key",
+        "excessive requests",
+        "exceeds your plan's set usage limit",
+        "exceeds the pay-as-you-go limit",
+        "upgrade your plan",
+        "usage limit",
+    ),
+}
 
 
 @dataclass
@@ -78,7 +106,7 @@ class ServiceConfig:
     @property
     def normalized_failure_patterns(self) -> list[str]:
         """返回小写化的失败特征，用于大小写不敏感匹配。"""
-        return [p.lower() for p in self.failure_patterns]
+        return [str(p).strip().lower() for p in self.failure_patterns if str(p).strip()]
 
 
 @dataclass
@@ -89,8 +117,9 @@ class GatewayConfig:
     access_keys: list[str] = field(default_factory=list)
     key_cooldown_seconds: int = DEFAULT_KEY_COOLDOWN_SECONDS
     session_ttl_seconds: int = 1800
-    max_failover_retries: int = 3
+    max_failover_retries: int = DEFAULT_MAX_FAILOVER_RETRIES
     upstream_timeout_seconds: int = 120
+    routing_mode: str = ROUTING_MODE_ROUND_ROBIN
 
     def validate(self) -> None:
         """校验网关配置。"""
@@ -98,6 +127,16 @@ class GatewayConfig:
             raise ValueError(f"端口非法：{self.port}")
         if not self.access_keys:
             raise ValueError("gateway.access_keys 不能为空，否则网关将无鉴权暴露")
+        if self.key_cooldown_seconds < 0:
+            raise ValueError("密钥冷却时间不能小于 0 秒")
+        if self.session_ttl_seconds <= 0:
+            raise ValueError("会话 TTL 必须大于 0 秒")
+        if self.max_failover_retries < 0:
+            raise ValueError("最大转移次数不能小于 0")
+        if self.upstream_timeout_seconds <= 0:
+            raise ValueError("上游超时必须大于 0 秒")
+        if self.routing_mode not in ROUTING_MODES:
+            raise ValueError(f"路由模式必须是 {ROUTING_MODES} 之一，当前为 {self.routing_mode}")
 
 
 @dataclass
@@ -137,13 +176,16 @@ def _parse_key_auth(raw: dict[str, Any] | None) -> KeyAuthConfig:
 
 def _parse_service(raw: dict[str, Any]) -> ServiceConfig:
     """解析单个服务配置。"""
+    raw_patterns = raw.get("failure_patterns")
+    if raw_patterns is None:
+        raw_patterns = DEFAULT_FAILURE_PATTERNS.get(str(raw.get("name", "")), ())
     return ServiceConfig(
         name=str(raw.get("name", "")),
         upstream_url=str(raw.get("upstream_url", "")),
         enabled=bool(raw.get("enabled", True)),
         key_auth=_parse_key_auth(raw.get("key_auth")),
         keys=list(raw.get("keys", []) or []),
-        failure_patterns=list(raw.get("failure_patterns", []) or []),
+        failure_patterns=[str(item) for item in (raw_patterns or [])],
     )
 
 
@@ -242,8 +284,14 @@ def load_config(path: str | None = None, *, strict: bool = True) -> AppConfig:
             int(gw_raw.get("key_cooldown_seconds", DEFAULT_KEY_COOLDOWN_SECONDS)),
         ),
         session_ttl_seconds=_env_int("GATEWAY_SESSION_TTL_SECONDS", int(gw_raw.get("session_ttl_seconds", 1800))),
-        max_failover_retries=_env_int("GATEWAY_MAX_FAILOVER_RETRIES", int(gw_raw.get("max_failover_retries", 3))),
+        max_failover_retries=_env_int(
+            "GATEWAY_MAX_FAILOVER_RETRIES",
+            int(gw_raw.get("max_failover_retries", DEFAULT_MAX_FAILOVER_RETRIES)),
+        ),
         upstream_timeout_seconds=_env_int("GATEWAY_UPSTREAM_TIMEOUT_SECONDS", int(gw_raw.get("upstream_timeout_seconds", 120))),
+        routing_mode=str(
+            env_keys.get("GATEWAY_ROUTING_MODE", [gw_raw.get("routing_mode", ROUTING_MODE_ROUND_ROBIN)])[0]
+        ).strip() or ROUTING_MODE_ROUND_ROBIN,
     )
 
     services = []
@@ -278,6 +326,7 @@ def dump_config(config: AppConfig, path: str | None = None) -> None:
         "GATEWAY_SESSION_TTL_SECONDS": config.gateway.session_ttl_seconds,
         "GATEWAY_MAX_FAILOVER_RETRIES": config.gateway.max_failover_retries,
         "GATEWAY_UPSTREAM_TIMEOUT_SECONDS": config.gateway.upstream_timeout_seconds,
+        "GATEWAY_ROUTING_MODE": config.gateway.routing_mode,
     }
     _save_env_keys(config.gateway.access_keys, services_keys, gateway_settings)
     

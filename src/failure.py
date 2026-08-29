@@ -22,8 +22,9 @@ from dataclasses import dataclass
 from .sse import parse_json_messages
 
 
-# 明确指示「密钥层面」失败的 HTTP 状态码（值得换密钥重试）
-KEY_LEVEL_HTTP_STATUS = {401, 402, 403, 429}
+# 明确指示「密钥层面」失败的 HTTP 状态码（值得换密钥重试）。
+# Tavily 官方错误码 432/433 分别表示套餐额度和按量额度上限。
+KEY_LEVEL_HTTP_STATUS = {401, 402, 403, 429, 432, 433}
 
 
 @dataclass
@@ -67,6 +68,8 @@ def detect_failure(
         if isinstance(err, dict):
             code = err.get("code")
             emsg = str(err.get("message", "")).lower()
+            if isinstance(code, int) and code in KEY_LEVEL_HTTP_STATUS:
+                return FailureResult(True, True, f"JSON-RPC 错误状态码 {code} 指示密钥失效/超限")
             # 鉴权/限流相关的 JSON-RPC 错误
             if _looks_like_key_error(emsg):
                 return FailureResult(True, True, f"JSON-RPC error: {err.get('message')}")
@@ -75,6 +78,9 @@ def detect_failure(
             _ = code
 
         result = msg.get("result")
+        key_error = _extract_key_level_upstream_error(result)
+        if key_error:
+            return FailureResult(True, True, key_error)
         retryable = _extract_retryable_upstream_error(result)
         if retryable:
             return FailureResult(True, False, retryable)
@@ -83,8 +89,20 @@ def detect_failure(
     if failure_patterns:
         haystack = body_text.lower()
         for pattern in failure_patterns:
-            if pattern and pattern in haystack:
-                return FailureResult(True, True, f"命中失败特征关键词: '{pattern}'")
+            normalized = str(pattern).strip().lower()
+            if not normalized:
+                continue
+            # 纯数字关键词表示 HTTP 状态码，不应在正文中做子串匹配。
+            if normalized.isdigit():
+                if status_code == int(normalized):
+                    return FailureResult(
+                        True,
+                        True,
+                        f"命中 HTTP 状态码失败特征: {status_code}",
+                    )
+                continue
+            if normalized in haystack:
+                return FailureResult(True, True, f"命中失败特征关键词: '{normalized}'")
 
     return FailureResult(False, False)
 
@@ -101,6 +119,9 @@ def _looks_like_key_error(message_lower: str) -> bool:
         "forbidden",
         "exceeds your plan",
         "usage limit",
+        "pay-as-you-go limit",
+        "excessive requests",
+        "missing or invalid api key",
     )
     return any(ind in message_lower for ind in indicators)
 
@@ -131,6 +152,29 @@ def _extract_retryable_upstream_error(result: object) -> str | None:
             return f"上游内部错误（状态 {status}）"
         if _looks_like_retryable_upstream_error(text.lower()):
             return f"上游临时错误：{text[:120]}"
+    return None
+
+
+def _extract_key_level_upstream_error(result: object) -> str | None:
+    """从 HTTP 200 的嵌套结果中提取密钥层面的状态码。"""
+    candidates: list[tuple[int | None, str]] = []
+    if not isinstance(result, dict):
+        return None
+
+    structured = result.get("structuredContent")
+    if structured is not None:
+        candidates.extend(_collect_status_and_text(structured))
+
+    for item in result.get("content", []) or []:
+        if not isinstance(item, dict) or item.get("type") != "text":
+            continue
+        candidates.extend(_collect_status_and_text(str(item.get("text", ""))))
+
+    # 某些服务直接把 status 放在 result 节点。
+    candidates.extend(_collect_status_and_text(result))
+    for status, _text in candidates:
+        if status in KEY_LEVEL_HTTP_STATUS:
+            return f"嵌套响应状态码 {status} 指示密钥失效/超限"
     return None
 
 

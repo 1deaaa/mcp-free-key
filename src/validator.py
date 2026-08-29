@@ -42,6 +42,8 @@ class ValidationResult:
     status: str               # 上述 STATUS_* 之一
     detail: str = ""          # 详情/错误信息
     latency_ms: int = 0       # 往返耗时（毫秒）
+    raw_error: str = ""       # 上游原始响应正文或网络错误
+    raw_status_code: int | None = None
 
     @property
     def ok(self) -> bool:
@@ -120,12 +122,28 @@ async def validate_key(
             # 1) initialize
             r_init = await client.post(url, headers=headers, json=init_body)
             if r_init.status_code in (401, 402, 403):
-                return _result(key, STATUS_INVALID, f"initialize 返回 {r_init.status_code}（鉴权失败）", loop, start)
+                return _result(
+                    key,
+                    STATUS_INVALID,
+                    f"initialize 返回 {r_init.status_code}（鉴权失败）",
+                    loop,
+                    start,
+                    raw_error=r_init.text,
+                    raw_status_code=r_init.status_code,
+                )
 
             fr_init = detect_failure(r_init.status_code, r_init.headers.get("content-type"), r_init.text, patterns)
             if fr_init.is_failure:
                 # initialize 阶段就失败，多半是鉴权问题
-                return _result(key, STATUS_INVALID, f"initialize 阶段失败：{fr_init.reason}", loop, start)
+                return _result(
+                    key,
+                    STATUS_INVALID,
+                    f"initialize 阶段失败：{fr_init.reason}",
+                    loop,
+                    start,
+                    raw_error=r_init.text,
+                    raw_status_code=r_init.status_code,
+                )
 
             # 取上游会话 id（有状态上游需要）
             sid = r_init.headers.get("mcp-session-id")
@@ -151,7 +169,15 @@ async def validate_key(
                 r_tools = await client.post(url, headers=sess_headers, json=tools_body)
                 fr_tools = detect_failure(r_tools.status_code, r_tools.headers.get("content-type"), r_tools.text, patterns)
                 if fr_tools.is_failure:
-                    return _result(key, STATUS_INVALID, f"tools/list 失败：{fr_tools.reason}", loop, start)
+                    return _result(
+                        key,
+                        STATUS_INVALID,
+                        f"tools/list 失败：{fr_tools.reason}",
+                        loop,
+                        start,
+                        raw_error=r_tools.text,
+                        raw_status_code=r_tools.status_code,
+                    )
                 return _result(key, STATUS_VALID, "鉴权通过（无探针，未做额度校验）", loop, start)
 
             call_body = {
@@ -163,19 +189,37 @@ async def validate_key(
             r_call = await client.post(url, headers=sess_headers, json=call_body)
             fr_call = detect_failure(r_call.status_code, r_call.headers.get("content-type"), r_call.text, patterns)
             if fr_call.is_failure:
-                return _result(key, STATUS_QUOTA, f"额度耗尽/受限：{fr_call.reason}", loop, start)
+                return _result(
+                    key,
+                    STATUS_QUOTA,
+                    f"额度耗尽/受限：{fr_call.reason}",
+                    loop,
+                    start,
+                    raw_error=r_call.text,
+                    raw_status_code=r_call.status_code,
+                )
 
             # 深度检查：即便没命中 failure_patterns，也扫一遍 content 文本中的常见超限提示
             extra = _scan_tool_result_for_quota(r_call.text, r_call.headers.get("content-type"))
             if extra:
-                return _result(key, STATUS_QUOTA, f"额度耗尽/受限：{extra}", loop, start)
+                return _result(
+                    key,
+                    STATUS_QUOTA,
+                    f"额度耗尽/受限：{extra}",
+                    loop,
+                    start,
+                    raw_error=r_call.text,
+                    raw_status_code=r_call.status_code,
+                )
 
             return _result(key, STATUS_VALID, "有效且有额度", loop, start)
 
     except httpx.HTTPError as e:
-        return _result(key, STATUS_ERROR, f"网络错误：{type(e).__name__}: {e}", loop, start)
+        detail = f"网络错误：{type(e).__name__}: {e}"
+        return _result(key, STATUS_ERROR, detail, loop, start, raw_error=detail)
     except Exception as e:  # noqa: BLE001 - 校验器需对任何异常稳健
-        return _result(key, STATUS_ERROR, f"未知错误：{type(e).__name__}: {e}", loop, start)
+        detail = f"未知错误：{type(e).__name__}: {e}"
+        return _result(key, STATUS_ERROR, detail, loop, start, raw_error=detail)
 
 
 def _scan_tool_result_for_quota(body_text: str, content_type: str | None) -> str | None:
@@ -185,7 +229,15 @@ def _scan_tool_result_for_quota(body_text: str, content_type: str | None) -> str
         命中时返回简短描述，否则 None。
     """
     messages = parse_json_messages(body_text, content_type)
-    indicators = ("exceeds your plan", "usage limit", "upgrade your plan", "rate limit", "quota")
+    indicators = (
+        "exceeds your plan",
+        "usage limit",
+        "upgrade your plan",
+        "rate limit",
+        "quota",
+        "pay-as-you-go limit",
+        "excessive requests",
+    )
     for msg in messages:
         result = msg.get("result")
         if not isinstance(result, dict):
@@ -203,10 +255,26 @@ def _scan_tool_result_for_quota(body_text: str, content_type: str | None) -> str
     return None
 
 
-def _result(key: str, status: str, detail: str, loop, start) -> ValidationResult:
+def _result(
+    key: str,
+    status: str,
+    detail: str,
+    loop,
+    start,
+    *,
+    raw_error: str = "",
+    raw_status_code: int | None = None,
+) -> ValidationResult:
     """构造结果并计算耗时。"""
     latency = int((loop.time() - start) * 1000)
-    return ValidationResult(key=key, status=status, detail=detail, latency_ms=latency)
+    return ValidationResult(
+        key=key,
+        status=status,
+        detail=detail,
+        latency_ms=latency,
+        raw_error=raw_error,
+        raw_status_code=raw_status_code,
+    )
 
 
 async def validate_keys(

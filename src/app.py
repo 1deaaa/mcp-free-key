@@ -16,7 +16,8 @@
 """
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
 import logging
 
 import httpx
@@ -57,6 +58,7 @@ def create_app(
         "client": client,
         "owns_client": client is None,
         "key_state_store": state_store or KeyStateStore(),
+        "retest_task": None,
     }
     access_keys = set(config.gateway.access_keys)
 
@@ -72,10 +74,29 @@ def create_app(
                 state["client"],
                 state_store=state["key_state_store"],
             )
+
+        async def retest_loop() -> None:
+            """周期性领取冷却到期密钥并执行自动复测。"""
+            while True:
+                try:
+                    await state["engine"].retest_expired_keys()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("自动复测任务执行失败")
+                await asyncio.sleep(5.0)
+
+        state["retest_task"] = asyncio.create_task(retest_loop())
         logger.info("网关已启动，聚合服务：%s，鉴权密钥数：%d",
                      [s.name for s in config.services], len(access_keys))
 
     async def on_shutdown() -> None:
+        task = state.get("retest_task")
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            state["retest_task"] = None
         if state["owns_client"] and state["client"] is not None:
             await state["client"].aclose()
 

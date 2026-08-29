@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -28,6 +29,8 @@ from src.config import (
     DEFAULT_KEY_COOLDOWN_SECONDS,
     GatewayConfig,
     KeyAuthConfig,
+    ROUTING_MODE_PRIMARY_BACKUP,
+    ROUTING_MODE_ROUND_ROBIN,
     ServiceConfig,
     dump_config,
     load_config,
@@ -44,6 +47,11 @@ APP_TITLE = "MCP 聚合网关"
 CONFIG_PATH = Path(DEFAULT_CONFIG_PATH)
 PROJECT_ROOT = CONFIG_PATH.parent
 START_SCRIPT = PROJECT_ROOT / "start.py"
+ROUTING_MODE_LABELS = {
+    ROUTING_MODE_ROUND_ROBIN: "轮询",
+    ROUTING_MODE_PRIMARY_BACKUP: "主备",
+}
+ROUTING_LABEL_MODES = {label: mode for mode, label in ROUTING_MODE_LABELS.items()}
 
 
 def _gateway_python_candidates() -> tuple[Path, ...]:
@@ -105,6 +113,7 @@ MONO_FONT_CANDIDATES = (
     "Consolas",
     "DejaVu Sans Mono",
 )
+FONT_SCALE = 1.6
 
 
 def select_font_family(
@@ -178,15 +187,39 @@ class GatewayEditor:
 
     def _ui_font(self, size: int, weight: str = "normal") -> ctk.CTkFont:
         """创建使用系统中文字体的 CustomTkinter 字体。"""
-        return ctk.CTkFont(family=self.ui_font_family, size=size, weight=weight)
+        return ctk.CTkFont(
+            family=self.ui_font_family,
+            size=max(10, round(size * FONT_SCALE)),
+            weight=weight,
+        )
+
+    def _tk_font(self, family: str, size: int) -> tuple[str, int]:
+        """创建与界面字号统一的 Tk 原生字体。"""
+        return family, max(10, round(size * FONT_SCALE))
 
     def _set_modal(self, dialog: ctk.CTkToplevel) -> None:
-        """等待弹窗完成映射后再设置模态，兼容 Linux Tk。"""
+        """在弹窗可见后设置模态，兼容 Linux Tk 的映射时序。"""
         dialog.transient(self.root)
-        dialog.update_idletasks()
-        if not dialog.winfo_viewable():
-            dialog.wait_visibility()
-        dialog.grab_set()
+        try:
+            dialog.update_idletasks()
+            dialog.deiconify()
+        except tk.TclError:
+            return
+        self._grab_when_viewable(dialog)
+
+    def _grab_when_viewable(self, dialog: ctk.CTkToplevel) -> None:
+        """等待窗口真正映射后再抢占输入焦点。"""
+        try:
+            if not dialog.winfo_exists():
+                return
+            if dialog.winfo_viewable():
+                dialog.grab_set()
+                dialog.focus_set()
+                return
+            dialog.after(30, lambda: self._grab_when_viewable(dialog))
+        except tk.TclError:
+            # 用户在窗口映射前关闭弹窗时无需再处理。
+            return
 
     # ── 布局构建 ──────────────────────────────────────────────────────────────
     def _build_ui(self) -> None:
@@ -204,14 +237,14 @@ class GatewayEditor:
 
     def _build_header(self, parent) -> None:
         """顶部标题栏 + 网关设置（单行紧凑布局）。"""
-        header = ctk.CTkFrame(parent, fg_color=CLR_PANEL, corner_radius=0, height=60)
+        header = ctk.CTkFrame(parent, fg_color=CLR_PANEL, corner_radius=0, height=96)
         header.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
-        header.grid_columnconfigure(1, weight=1)
+        header.grid_columnconfigure(0, weight=1)
         header.grid_propagate(False)
 
         # 左侧品牌标题（紧凑单行）
         title_box = ctk.CTkFrame(header, fg_color="transparent")
-        title_box.grid(row=0, column=0, sticky="ns", padx=(16, 20), pady=8)
+        title_box.grid(row=0, column=0, sticky="w", padx=(16, 20), pady=(8, 0))
         ctk.CTkLabel(title_box, text="⚡ MCP Gateway",
                      font=self._ui_font(16, "bold"),
                      text_color=CLR_ACCENT).pack(side="left", padx=(0, 8))
@@ -221,7 +254,7 @@ class GatewayEditor:
 
         # 右侧：所有网关参数一行排列
         gw_box = ctk.CTkFrame(header, fg_color="transparent")
-        gw_box.grid(row=0, column=1, sticky="nsew", padx=(0, 16), pady=8)
+        gw_box.grid(row=1, column=0, sticky="ew", padx=16, pady=(2, 8))
         self._build_gateway_fields(gw_box)
 
     def _build_gateway_fields(self, parent) -> None:
@@ -232,14 +265,30 @@ class GatewayEditor:
         self.ttl_var      = ctk.StringVar()
         self.retry_var    = ctk.StringVar()
         self.timeout_var  = ctk.StringVar()
+        self.routing_mode_var = ctk.StringVar(value=ROUTING_MODE_LABELS[ROUTING_MODE_ROUND_ROBIN])
 
         # 全部参数一行
         self._lbl_entry(parent, "端口", self.port_var, width=70)
         self._lbl_entry(parent, "访问密钥", self.gw_key_var, width=260)
         self._lbl_entry(parent, "冷却(秒)", self.cooldown_var, width=70)
         self._lbl_entry(parent, "TTL(秒)", self.ttl_var, width=70)
-        self._lbl_entry(parent, "重试", self.retry_var, width=50)
+        self._lbl_entry(parent, "转移次数", self.retry_var, width=70)
         self._lbl_entry(parent, "超时(秒)", self.timeout_var, width=70)
+        ctk.CTkLabel(parent, text="路由模式", font=self._ui_font(12),
+                     text_color=CLR_MUTED).pack(side="left", padx=(0, 4))
+        mode_combo = ctk.CTkComboBox(
+            parent,
+            variable=self.routing_mode_var,
+            values=list(ROUTING_LABEL_MODES),
+            state="readonly",
+            width=100,
+            fg_color=CLR_ENTRY_BG,
+            border_color=CLR_ACCENT,
+            text_color=CLR_TEXT,
+            font=self._ui_font(12),
+        )
+        mode_combo.pack(side="left", padx=(0, 0))
+        self._add_tooltip(mode_combo, "轮询：各密钥均衡使用；主备：优先使用列表第一把可用密钥")
 
     def _lbl_entry(self, parent, label: str, var: ctk.StringVar, width: int = 120) -> None:
         """标签 + 输入框组合（横向排列）。"""
@@ -275,7 +324,7 @@ class GatewayEditor:
                      text_color=CLR_ACCENT).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 6))
 
         # 列表框（不设 width，让 grid 控制宽度）
-        self.svc_listbox = tk.Listbox(left, font=(self.ui_font_family, 11),
+        self.svc_listbox = tk.Listbox(left, font=self._tk_font(self.ui_font_family, 11),
                                       bg=CLR_ENTRY_BG, fg=CLR_TEXT, selectmode="single",
                                       activestyle="none", relief="flat", bd=0,
                                       highlightthickness=0,
@@ -375,8 +424,15 @@ class GatewayEditor:
         keys_lbl = ctk.CTkLabel(lower, text="🔑 密钥状态", font=self._ui_font(11, "bold"),
                                text_color=CLR_ACCENT)
         keys_lbl.grid(row=0, column=0, sticky="w", pady=(0, 4))
+        self.key_status_label = ctk.CTkLabel(
+            lower,
+            text="",
+            font=self._ui_font(10),
+            text_color=CLR_MUTED,
+        )
+        self.key_status_label.grid(row=0, column=0, sticky="e", pady=(0, 4))
 
-        self.keys_tree = tk.Listbox(lower, height=6, font=(self.mono_font_family, 10),
+        self.keys_tree = tk.Listbox(lower, height=6, font=self._tk_font(self.mono_font_family, 10),
                                    bg=CLR_ENTRY_BG, fg=CLR_TEXT, selectmode="extended",
                                    activestyle="none", relief="flat", bd=0,
                                    highlightthickness=0)
@@ -391,7 +447,7 @@ class GatewayEditor:
                                    text_color=CLR_ACCENT)
         patterns_lbl.grid(row=0, column=1, sticky="w", pady=(0, 4))
 
-        self.patterns_text = tk.Text(lower, height=6, width=20, font=(self.mono_font_family, 10),
+        self.patterns_text = tk.Text(lower, height=6, width=20, font=self._tk_font(self.mono_font_family, 10),
                                     bg=CLR_ENTRY_BG, fg=CLR_TEXT, relief="flat", bd=0,
                                     highlightthickness=0, wrap="none")
         self.patterns_text.grid(row=1, column=1, sticky="nsew")
@@ -403,33 +459,36 @@ class GatewayEditor:
         # 操作按钮行（两行布局：第一行管理，第二行测试/恢复）
         btn_row = ctk.CTkFrame(editor, fg_color="transparent")
         btn_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
-        for i in range(9):
+        for i in range(5):
             btn_row.grid_columnconfigure(i, weight=1)
 
         ctk.CTkButton(btn_row, text="💾 保存配置", command=self._save,
                      fg_color=CLR_ACCENT, hover_color=CLR_HOVER,
-                     font=self._ui_font(11, "bold")).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+                     font=self._ui_font(11, "bold")).grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 4))
         ctk.CTkButton(btn_row, text="📥 批量导入密钥", command=self._import_keys,
                      fg_color="#0d9488", hover_color="#0f766e",
-                     font=self._ui_font(11, "bold")).grid(row=0, column=1, sticky="ew", padx=4)
+                     font=self._ui_font(11, "bold")).grid(row=0, column=1, sticky="ew", padx=4, pady=(0, 4))
         ctk.CTkButton(btn_row, text="🧪 测试选中密钥", command=self._test_selected_keys,
                      fg_color=CLR_ACCENT2, hover_color="#6d28d9",
-                     font=self._ui_font(11)).grid(row=0, column=2, sticky="ew", padx=4)
+                     font=self._ui_font(11)).grid(row=0, column=2, sticky="ew", padx=4, pady=(0, 4))
         ctk.CTkButton(btn_row, text="🧪 测试全部密钥", command=self._test_all_keys,
                      fg_color="#0284c7", hover_color="#0369a1",
-                     font=self._ui_font(11)).grid(row=0, column=3, sticky="ew", padx=4)
+                     font=self._ui_font(11)).grid(row=0, column=3, sticky="ew", padx=4, pady=(0, 4))
         ctk.CTkButton(btn_row, text="📊 查询额度", command=self._query_selected_usage,
                      fg_color="#0f766e", hover_color="#115e59",
-                     font=self._ui_font(11)).grid(row=0, column=4, sticky="ew", padx=4)
+                     font=self._ui_font(11)).grid(row=0, column=4, sticky="ew", padx=4, pady=(0, 4))
         ctk.CTkButton(btn_row, text="♻️ 恢复选中", command=self._reset_selected_key_states,
                      fg_color="#166534", hover_color="#15803d",
-                     font=self._ui_font(11)).grid(row=0, column=5, sticky="ew", padx=4)
+                     font=self._ui_font(11)).grid(row=1, column=0, sticky="ew", padx=(0, 4))
         ctk.CTkButton(btn_row, text="♻️ 恢复全部失效密钥", command=self._reset_all_disabled_keys,
                      fg_color="#166534", hover_color="#15803d",
-                     font=self._ui_font(11, "bold")).grid(row=0, column=6, sticky="ew", padx=4)
+                     font=self._ui_font(11, "bold")).grid(row=1, column=1, sticky="ew", padx=4)
+        ctk.CTkButton(btn_row, text="查看原始错误", command=self._show_raw_errors,
+                     fg_color="#475569", hover_color="#334155",
+                     font=self._ui_font(11)).grid(row=1, column=2, sticky="ew", padx=4)
         ctk.CTkButton(btn_row, text="🗑️ 删除选中", command=self._delete_selected_keys,
                      fg_color="#7f1d1d", hover_color="#991b1b",
-                     font=self._ui_font(11)).grid(row=0, column=7, sticky="ew", padx=(4, 0))
+                     font=self._ui_font(11)).grid(row=1, column=3, sticky="ew", padx=4)
         self.restart_button = ctk.CTkButton(
             btn_row,
             text="🔄 重启服务",
@@ -438,7 +497,7 @@ class GatewayEditor:
             hover_color="#92400e",
             font=self._ui_font(11, "bold"),
         )
-        self.restart_button.grid(row=0, column=8, sticky="ew", padx=(4, 0))
+        self.restart_button.grid(row=1, column=4, sticky="ew", padx=(4, 0))
 
     def _build_log_panel(self, parent) -> None:
         """底部：全宽 MCP 示例 + 测试日志（40/60 分栏）。"""
@@ -463,7 +522,7 @@ class GatewayEditor:
                      width=60, height=24, fg_color=CLR_ACCENT, hover_color=CLR_HOVER,
                      font=self._ui_font(10)).pack(side="right")
 
-        self.mcp_example_text = tk.Text(mcp_frame, height=7, font=(self.mono_font_family, 10),
+        self.mcp_example_text = tk.Text(mcp_frame, height=7, font=self._tk_font(self.mono_font_family, 10),
                                        bg=CLR_ENTRY_BG, fg=CLR_TEXT, relief="flat", bd=0,
                                        highlightthickness=0, wrap="word", state="disabled")
         self.mcp_example_text.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
@@ -483,7 +542,7 @@ class GatewayEditor:
                      border_width=1, border_color=CLR_BORDER,
                      font=self._ui_font(10)).pack(side="right")
 
-        self.log_text = tk.Text(log_frame, height=7, font=(self.mono_font_family, 10),
+        self.log_text = tk.Text(log_frame, height=7, font=self._tk_font(self.mono_font_family, 10),
                                bg=CLR_ENTRY_BG, fg=CLR_TEXT, relief="flat", bd=0,
                                highlightthickness=0, wrap="word")
         self.log_text.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
@@ -501,6 +560,7 @@ class GatewayEditor:
         self.ttl_var.set(str(gw.session_ttl_seconds))
         self.retry_var.set(str(gw.max_failover_retries))
         self.timeout_var.set(str(gw.upstream_timeout_seconds))
+        self.routing_mode_var.set(ROUTING_MODE_LABELS.get(gw.routing_mode, "轮询"))
 
     def _load_service(self, svc: ServiceConfig) -> None:
         self.svc_name_var.set(svc.name)
@@ -542,6 +602,15 @@ class GatewayEditor:
         stats = self._stats_cache.get(svc.name, {}).get("keys", {}).get("details", [])
         stats_map = {item["key"]: item for item in stats if "key" in item}
         persisted_map = self.state_store.build_key_map(svc.name, svc.keys)
+        service_stats = self._stats_cache.get(svc.name, {})
+        mode = ROUTING_MODE_LABELS.get(
+            service_stats.get("routing_mode") or ROUTING_LABEL_MODES.get(self.routing_mode_var.get()),
+            "轮询",
+        )
+        primary_tail = service_stats.get("primary_key_tail") or "暂无"
+        self.key_status_label.configure(
+            text=f"{mode} | 当前主 ...{primary_tail}" if mode == "主备" else f"{mode}模式"
+        )
 
         for key in svc.keys:
             status_str = "正常"
@@ -551,17 +620,42 @@ class GatewayEditor:
                     self._restored_keys.discard((svc.name, key))
             else:
                 persisted = persisted_map.get(key)
-                if persisted and persisted.get("is_disabled"):
-                    status_str = "永久禁用"
-                    tag_color = CLR_ERROR
+                if persisted and (
+                    persisted.get("is_disabled") or persisted.get("retest_pending")
+                ):
+                    if persisted.get("retest_pending"):
+                        remaining = persisted.get("disabled_remaining", 0)
+                        if remaining > 0:
+                            status_str = f"冷却中({int(remaining)}s)"
+                        else:
+                            status_str = "等待复测"
+                        tag_color = CLR_WARN
+                    elif persisted.get("disabled_until_epoch", 0) > 0:
+                        status_str = "禁用至下月"
+                        tag_color = CLR_ERROR
+                    else:
+                        status_str = "永久禁用"
+                        tag_color = CLR_ERROR
                 elif key in stats_map:
                     info = stats_map[key]
                     if info.get("is_disabled"):
-                        status_str = "永久禁用"
-                        tag_color = CLR_ERROR
+                        if info.get("retest_pending"):
+                            if info.get("cooldown_remaining", 0) > 0:
+                                status_str = f"冷却中({int(info['cooldown_remaining'])}s)"
+                            else:
+                                status_str = "等待复测"
+                            tag_color = CLR_WARN
+                        else:
+                            status_str = "永久禁用"
+                            tag_color = CLR_ERROR
                     elif info.get("cooldown_remaining", 0) > 0:
                         status_str = f"冷却中({int(info['cooldown_remaining'])}s)"
                         tag_color = CLR_WARN
+            record = persisted_map.get(key)
+            monthly_success_count = (
+                record.get("monthly_success_count", 0) if record else stats_map.get(key, {}).get("monthly_success_count", 0)
+            )
+            status_str = f"{status_str} | 本月成功{monthly_success_count}"
             usage = self._usage_cache.get((svc.name, key))
             if usage and usage.ok and usage.key_remaining is not None and usage.key_limit is not None:
                 status_str = f"{status_str} | 余{usage.key_remaining}/{usage.key_limit}"
@@ -612,8 +706,12 @@ class GatewayEditor:
                 self.cooldown_var.get().strip() or str(DEFAULT_KEY_COOLDOWN_SECONDS)
             ),
             session_ttl_seconds=int(self.ttl_var.get().strip() or "1800"),
-            max_failover_retries=int(self.retry_var.get().strip() or "3"),
+            max_failover_retries=int(self.retry_var.get().strip() or "1"),
             upstream_timeout_seconds=int(self.timeout_var.get().strip() or "120"),
+            routing_mode=ROUTING_LABEL_MODES.get(
+                self.routing_mode_var.get().strip(),
+                ROUTING_MODE_ROUND_ROBIN,
+            ),
         )
 
     def _apply_current(self, silent: bool = False) -> bool:
@@ -859,7 +957,7 @@ class GatewayEditor:
                     text_color=CLR_TEXT).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 8))
 
         # 文本框
-        text_area = tk.Text(dialog, font=(self.mono_font_family, 11), bg=CLR_ENTRY_BG, fg=CLR_TEXT,
+        text_area = tk.Text(dialog, font=self._tk_font(self.mono_font_family, 11), bg=CLR_ENTRY_BG, fg=CLR_TEXT,
                            relief="flat", bd=0, highlightthickness=0, wrap="none",
                            insertbackground=CLR_TEXT)
         text_area.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
@@ -889,6 +987,63 @@ class GatewayEditor:
         ctk.CTkButton(btn_row, text="导入", command=do_import, width=80,
                      fg_color=CLR_ACCENT, hover_color=CLR_HOVER,
                      font=self._ui_font(11)).pack(side="right", padx=(0, 4))
+
+    def _show_raw_errors(self) -> None:
+        """显示选中密钥最近一次失败的原始响应。"""
+        if self.current_index < 0:
+            return
+        selections = self.keys_tree.curselection()
+        if not selections:
+            messagebox.showwarning(APP_TITLE, "请先选择要查看的密钥")
+            return
+
+        svc = self.config.services[self.current_index]
+        records = self.state_store.build_key_map(svc.name, svc.keys)
+        stats = self._stats_cache.get(svc.name, {}).get("keys", {}).get("details", [])
+        stats_map = {item["key"]: item for item in stats if "key" in item}
+        reports: list[str] = []
+        for index in selections:
+            if not (0 <= index < len(svc.keys)):
+                continue
+            key = svc.keys[index]
+            record = records.get(key, {})
+            info = stats_map.get(key, {})
+            raw_error = record.get("raw_error") or info.get("raw_error") or "暂无原始错误记录"
+            status_code = record.get("raw_status_code") or info.get("raw_status_code")
+            status_text = f"HTTP {status_code}" if status_code else "无 HTTP 状态码"
+            reports.append(f"密钥 ...{key[-6:]} | {status_text}\n{raw_error}")
+
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("原始错误详情")
+        dialog.geometry("900x560")
+        dialog.minsize(600, 360)
+        dialog.configure(fg_color=CLR_BG)
+        self._set_modal(dialog)
+        dialog.grid_columnconfigure(0, weight=1)
+        dialog.grid_rowconfigure(0, weight=1)
+
+        text_widget = tk.Text(
+            dialog,
+            font=self._tk_font(self.mono_font_family, 10),
+            bg=CLR_ENTRY_BG,
+            fg=CLR_TEXT,
+            insertbackground=CLR_TEXT,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            wrap="word",
+        )
+        text_widget.grid(row=0, column=0, sticky="nsew", padx=16, pady=(16, 8))
+        text_widget.insert("1.0", "\n\n".join(reports))
+        text_widget.configure(state="disabled")
+        ctk.CTkButton(
+            dialog,
+            text="确定",
+            command=dialog.destroy,
+            fg_color=CLR_ACCENT,
+            hover_color=CLR_HOVER,
+            font=self._ui_font(11),
+        ).grid(row=1, column=0, sticky="e", padx=16, pady=(0, 16))
 
     def _delete_selected_keys(self) -> None:
         """删除选中的密钥。"""
@@ -943,7 +1098,11 @@ class GatewayEditor:
         for key in svc.keys:
             is_disabled = False
             persisted = persisted_map.get(key)
-            if persisted and persisted.get("is_disabled"):
+            if persisted and (
+                persisted.get("is_disabled")
+                or persisted.get("retest_pending")
+                or persisted.get("retest_due")
+            ):
                 is_disabled = True
             elif key in stats_map:
                 info = stats_map[key]
@@ -1116,7 +1275,7 @@ class GatewayEditor:
 
         report = "\n".join([f"✅ 有效密钥 ({ok} 把):"] + valid_list +
                            ["", f"❌ 失败密钥 ({failed} 把):"] + failed_list)
-        text_widget = tk.Text(result_dialog, font=(self.mono_font_family, 10), bg=CLR_ENTRY_BG, fg=CLR_TEXT,
+        text_widget = tk.Text(result_dialog, font=self._tk_font(self.mono_font_family, 10), bg=CLR_ENTRY_BG, fg=CLR_TEXT,
                              relief="flat", bd=0, highlightthickness=0, wrap="none")
         text_widget.grid(row=1, column=0, sticky="nsew", padx=16, pady=8)
         text_widget.insert("1.0", report)
@@ -1177,7 +1336,7 @@ class GatewayEditor:
             [f"✅ 查询成功 ({ok} 把):"] + ok_lines +
             ["", f"❌ 查询失败 ({failed} 把):"] + fail_lines
         )
-        text_widget = tk.Text(result_dialog, font=(self.mono_font_family, 10), bg=CLR_ENTRY_BG, fg=CLR_TEXT,
+        text_widget = tk.Text(result_dialog, font=self._tk_font(self.mono_font_family, 10), bg=CLR_ENTRY_BG, fg=CLR_TEXT,
                              relief="flat", bd=0, highlightthickness=0, wrap="none")
         text_widget.grid(row=1, column=0, sticky="nsew", padx=16, pady=8)
         text_widget.insert("1.0", report)
@@ -1282,6 +1441,8 @@ class GatewayEditor:
             svc.name,
             result.key,
             reason=f"manual_test_failed:{result.status}",
+            raw_error=getattr(result, "raw_error", "") or result.detail,
+            raw_status_code=getattr(result, "raw_status_code", None),
         )
         self._restored_keys.discard((svc.name, result.key))
         self._usage_cache.pop((svc.name, result.key), None)
@@ -1308,6 +1469,21 @@ class GatewayEditor:
 
 
 # ── 入口 ──────────────────────────────────────────────────────────────────────
+def _configure_linux_display(root: tk.Misc) -> None:
+    """修正 Linux Wayland/XWayland 下 Tk 默认缩放过小导致的字体发糊。"""
+    if not sys.platform.startswith("linux"):
+        return
+    session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
+    if session_type != "wayland" and not os.environ.get("WAYLAND_DISPLAY"):
+        return
+    try:
+        current = float(root.tk.call("tk", "scaling"))
+        # Tk 8.6 在 XWayland 下常把 1.0 当作默认值，至少提升到 1.25。
+        root.tk.call("tk", "scaling", max(current, 1.25))
+    except (tk.TclError, TypeError, ValueError):
+        pass
+
+
 def main() -> None:
     # 在创建窗口前先设置 DPI 感知（不需要 Tk 实例）
     try:
@@ -1318,6 +1494,7 @@ def main() -> None:
         except Exception:
             pass
     root = ctk.CTk()
+    _configure_linux_display(root)
     root.configure(fg_color=CLR_BG)
     GatewayEditor(root)
     root.mainloop()

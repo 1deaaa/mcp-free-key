@@ -53,6 +53,8 @@ class ProxyResponse:
     body: bytes
     used_key_tail: str = ""          # 实际使用的密钥尾部（调试用）
     attempts: int = 1               # 实际尝试次数（含故障转移）
+    raw_error: str = ""              # 上游原始正文（失败时供状态记录）
+    raw_status_code: int | None = None
 
 
 @dataclass
@@ -101,6 +103,7 @@ class ProxyEngine:
                     cooldown_seconds=config.gateway.key_cooldown_seconds,
                     service_name=svc.name,
                     state_store=state_store,
+                    routing_mode=config.gateway.routing_mode,
                 )
             self._runtimes[svc.name] = ServiceRuntime(
                 config=svc,
@@ -184,7 +187,11 @@ class ProxyEngine:
         pool = runtime.pool
         assert pool is not None
 
-        max_attempts = max(1, min(self._config.gateway.max_failover_retries, pool.size))
+        # 配置项表示“最多转移几次”，所以总尝试次数要包含首次请求。
+        max_attempts = min(
+            pool.size,
+            self._config.gateway.max_failover_retries + 1,
+        )
         tried: set[str] = set()
         last_resp: ProxyResponse | None = None
 
@@ -193,10 +200,7 @@ class ProxyEngine:
             # 这样即便在故障转移场景下也能保持 round-robin 负载均衡。
             key = await pool.next_key_excluding(exclude=tried)
             if key is None:
-                key = await pool.next_key()
-                if key in tried:
-                    # 没有新密钥可试，终止
-                    break
+                break
             tried.add(key)
 
             resp, failure, is_key = await self._forward_once_detect(
@@ -215,7 +219,12 @@ class ProxyEngine:
 
             # 失败：仅密钥层面失效才标记冷却，5xx 等上游临时故障不惩罚密钥
             if is_key:
-                await pool.mark_failed(key)
+                await pool.mark_failed(
+                    key,
+                    reason=failure or "key_failure",
+                    raw_error=resp.raw_error,
+                    raw_status_code=resp.raw_status_code,
+                )
                 logger.warning(
                     "服务 [%s] 密钥 ...%s 被判定为密钥失败（尝试 %d/%d）：%s",
                     svc.name, key[-6:], attempt, max_attempts, failure,
@@ -259,13 +268,16 @@ class ProxyEngine:
             )
         except httpx.HTTPError as e:
             # 网络层错误也视为该密钥本次失败，允许故障转移
+            detail = f"网络错误：{type(e).__name__}: {e}"
             resp = ProxyResponse(
                 status_code=502,
                 headers={"content-type": "application/json"},
                 body=b'{"error":"upstream unreachable"}',
                 used_key_tail=key[-6:] if key else "",
+                raw_error=detail,
+                raw_status_code=502,
             )
-            return resp, f"网络错误：{type(e).__name__}: {e}", False
+            return resp, detail, False
 
         body_bytes = upstream.content
         body_text = self._safe_text(upstream)
@@ -280,6 +292,8 @@ class ProxyEngine:
             headers=self._build_response_headers(upstream.headers),
             body=body_bytes,
             used_key_tail=key[-6:] if key else "",
+            raw_error=body_text,
+            raw_status_code=upstream.status_code,
         )
         return resp, (fr.reason if fr.is_failure else None), fr.is_key_failure
 
@@ -294,15 +308,63 @@ class ProxyEngine:
         extra_path: str,
     ) -> ProxyResponse:
         """单次转发（无故障转移），用于会话粘连或无密钥服务。"""
-        resp, _failure, _is_key = await self._forward_once_detect(
+        resp, failure, is_key = await self._forward_once_detect(
             runtime, method, base_headers, body, key, client_session_id, extra_path,
         )
+        if key is not None:
+            if failure is None:
+                if runtime.pool is not None:
+                    await runtime.pool.mark_success(key)
+            elif is_key and runtime.pool:
+                await runtime.pool.mark_failed(
+                    key,
+                    reason=failure,
+                    raw_error=resp.raw_error,
+                    raw_status_code=resp.raw_status_code,
+                )
         # 单次转发也尝试绑定新会话（无密钥服务 key 为 None 时不绑定）
         if key is not None:
             new_sid = resp.headers.get("mcp-session-id") or resp.headers.get("Mcp-Session-Id")
             if new_sid and not client_session_id:
                 await runtime.sessions.bind(new_sid, key)
         return resp
+
+    async def retest_expired_keys(self) -> int:
+        """自动复测所有已结束冷却的密钥。"""
+        from .validator import validate_key
+
+        retested = 0
+        timeout = min(45.0, float(self._config.gateway.upstream_timeout_seconds))
+        for runtime in self._runtimes.values():
+            pool = runtime.pool
+            if pool is None:
+                continue
+            candidates = await pool.pending_retest_keys()
+            for key in candidates:
+                retested += 1
+                result = await validate_key(
+                    runtime.config,
+                    key,
+                    deep=True,
+                    timeout=timeout,
+                )
+                if result.ok:
+                    await pool.mark_retest_success(key)
+                    logger.info("服务 [%s] 密钥 ...%s 自动复测成功，已恢复", runtime.config.name, key[-6:])
+                else:
+                    await pool.mark_retest_failed(
+                        key,
+                        reason=f"automatic_retest_failed:{result.status}",
+                        raw_error=result.raw_error or result.detail,
+                        raw_status_code=result.raw_status_code,
+                    )
+                    logger.warning(
+                        "服务 [%s] 密钥 ...%s 自动复测失败，已永久禁用：%s",
+                        runtime.config.name,
+                        key[-6:],
+                        result.detail,
+                    )
+        return retested
 
     def _inject_key(
         self, svc: ServiceConfig, base_headers: dict[str, str], key: str | None, extra_path: str = "",
@@ -384,6 +446,8 @@ class ProxyEngine:
                     "cooling": ps.cooling,
                     "details": ps.details,
                 }
+                entry["routing_mode"] = rt.pool.routing_mode
+                entry["primary_key_tail"] = await rt.pool.primary_key_tail()
             out[name] = entry
         return out
 
@@ -392,5 +456,4 @@ class ProxyEngine:
         runtime = self._runtimes.get(service_name)
         if runtime is None or runtime.pool is None:
             return False
-        await runtime.pool.reset_key_state(key)
-        return True
+        return await runtime.pool.reset_key_state(key)
