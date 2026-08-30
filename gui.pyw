@@ -174,6 +174,8 @@ class GatewayEditor:
         self._auto_apply_after_id: str | None = None
         self._auto_apply_generation = 0
         self._auto_apply_inflight = False
+        self._key_state_poll_after_id: str | None = None
+        self._key_state_mtime_ns: int | None = None
 
         # 实例级缓存（避免类变量在多实例间共享）
         self._stats_cache: dict = {}
@@ -191,6 +193,7 @@ class GatewayEditor:
         self._load_gateway()
         self._refresh_service_list(select_index=self.current_index)
         self._suspend_auto_apply = False
+        self._schedule_key_state_poll()
 
     def _ui_font(self, size: int, weight: str = "normal") -> ctk.CTkFont:
         """创建使用系统中文字体的 CustomTkinter 字体。"""
@@ -347,6 +350,29 @@ class GatewayEditor:
             except tk.TclError:
                 pass
         self._auto_apply_after_id = self.root.after(500, self._auto_apply)
+
+    def _schedule_key_state_poll(self) -> None:
+        """定期检查共享状态文件，让 GUI 及时显示最新月度次数和状态。"""
+        self._key_state_poll_after_id = self.root.after(250, self._poll_key_state)
+
+    def _poll_key_state(self) -> None:
+        """状态文件发生变化时刷新当前服务的密钥列表。"""
+        self._key_state_poll_after_id = None
+        try:
+            try:
+                mtime_ns = os.stat(self.state_store.path).st_mtime_ns
+            except FileNotFoundError:
+                mtime_ns = None
+            if mtime_ns != self._key_state_mtime_ns:
+                self._key_state_mtime_ns = mtime_ns
+                if 0 <= self.current_index < len(self.config.services):
+                    self._refresh_keys_list(self.config.services[self.current_index])
+        except (OSError, tk.TclError):
+            return
+        try:
+            self._schedule_key_state_poll()
+        except tk.TclError:
+            pass
 
     def _build_body(self, parent) -> None:
         """中部主体：上半区编辑，下半区全宽日志/示例。"""
@@ -659,6 +685,11 @@ class GatewayEditor:
 
     def _refresh_keys_list(self, svc: ServiceConfig) -> None:
         """刷新密钥列表，根据状态着色。"""
+        selected_keys = {
+            svc.keys[index]
+            for index in self.keys_tree.curselection()
+            if 0 <= index < len(svc.keys)
+        }
         self.keys_tree.delete(0, "end")
         # 后台异步拉取状态（不阻塞 UI）
         if not self._stats_cache or (time.time() - self._stats_cache_time > 3.0):
@@ -728,6 +759,8 @@ class GatewayEditor:
             self.keys_tree.insert("end", f"  {display}  [{status_str}]")
             idx = self.keys_tree.size() - 1
             self.keys_tree.itemconfig(idx, fg=tag_color)
+            if key in selected_keys:
+                self.keys_tree.selection_set(idx)
 
     def _on_select(self, _event=None) -> None:
         sel = self.svc_listbox.curselection()

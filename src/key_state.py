@@ -65,8 +65,11 @@ def current_utc_period(now: datetime | None = None) -> str:
 
 
 def next_month_start_epoch(now: datetime | None = None) -> float:
-    """返回本地时区下个自然月 1 号 00:00 的时间戳。"""
-    now = now or datetime.now().astimezone()
+    """返回 UTC 下个自然月 1 号 00:00 的时间戳。"""
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
     if now.month == 12:
         next_month = now.replace(
             year=now.year + 1,
@@ -316,6 +319,7 @@ class KeyStateStore:
     def reset_key(self, service_name: str, key: str) -> None:
         """清除某把密钥的失效状态，但保留本月成功次数。"""
         data = self._load()
+        self._cleanup_expired(data)
         services = data.get("services") or {}
         service = services.get(service_name) or {}
         keys = service.get("keys") or {}
@@ -344,6 +348,11 @@ class KeyStateStore:
                 if not service:
                     services.pop(service_name, None)
             self._save(data)
+
+    def rollover_monthly_state(self) -> int:
+        """执行一次 UTC 月度轮换，并返回自动恢复的密钥数量。"""
+        data = self._load()
+        return self._cleanup_expired(data)
 
     def build_key_map(self, service_name: str, keys: list[str]) -> dict[str, dict[str, Any]]:
         """返回适合 GUI 展示的状态映射。"""
@@ -413,16 +422,51 @@ class KeyStateStore:
         self._cache = data
         self._mtime_ns = os.stat(self.path).st_mtime_ns
 
-    def _cleanup_expired(self, data: dict[str, Any]) -> None:
-        """清理已到期的非复测状态，保留待自动复测记录。"""
+    def _cleanup_expired(self, data: dict[str, Any]) -> int:
+        """清理到期状态，并处理 UTC 月初的计数归零和额度型密钥恢复。"""
         changed = False
         now = time.time()
+        period = current_utc_period()
+        restored_count = 0
         services = data.get("services") or {}
         for service_name in list(services.keys()):
             service = services.get(service_name) or {}
             keys = service.get("keys") or {}
             for key in list(keys.keys()):
                 state = self._parse_state(keys[key])
+
+                if state.monthly_period != period:
+                    if (
+                        state.is_disabled
+                        and state.disabled_until_epoch <= 0
+                        and not state.retest_pending
+                        and self._is_monthly_quota_disabled(state)
+                    ):
+                        keys[key] = self._state_payload(
+                            state,
+                            is_disabled=False,
+                            disabled_until_epoch=0.0,
+                            reason="",
+                            fail_count=0,
+                            consecutive_fails=0,
+                            updated_at="",
+                            raw_error="",
+                            raw_status_code=None,
+                            retest_pending=False,
+                            monthly_period=period,
+                            monthly_success_count=0,
+                        )
+                        restored_count += 1
+                        changed = True
+                        continue
+
+                    keys[key] = self._state_payload(
+                        state,
+                        monthly_period=period,
+                        monthly_success_count=0,
+                    )
+                    changed = True
+
                 if not state.is_disabled:
                     continue
                 if state.disabled_until_epoch <= 0 or state.disabled_until_epoch > now:
@@ -454,6 +498,29 @@ class KeyStateStore:
                 changed = True
         if changed:
             self._save(data)
+        return restored_count
+
+    @staticmethod
+    def _is_monthly_quota_disabled(state: PersistedKeyState) -> bool:
+        """判断永久禁用是否由可在自然月重置的额度耗尽导致。"""
+        if state.raw_status_code in {432, 433}:
+            return True
+        haystack = " ".join((state.reason, state.raw_error)).casefold()
+        indicators = (
+            "quota_exhausted",
+            "quota exhausted",
+            "quota exceeded",
+            "monthly quota",
+            "monthly limit",
+            "free monthly",
+            "free plan",
+            "free tier",
+            "exceeds your plan",
+            "plan usage limit",
+            "usage limit",
+            "pay-as-you-go limit",
+        )
+        return any(indicator in haystack for indicator in indicators)
 
     @staticmethod
     def _parse_state(raw: Any) -> PersistedKeyState:

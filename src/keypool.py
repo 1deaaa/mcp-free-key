@@ -141,23 +141,24 @@ class KeyPool:
                     raw_status_code=raw_status_code,
                 )
 
-    async def mark_success(self, key: str) -> None:
+    async def mark_success(self, key: str) -> int | None:
         """标记正常请求成功，恢复密钥并记录本月成功次数。"""
         async with self._lock:
             self._sync_persisted_states_locked()
             state = self._find_state(key)
             if state is None:
-                return
+                return None
             state.cooldown_until = 0.0
             state.success_count += 1
             state.consecutive_fails = 0
             state.is_disabled = False
             state.retest_pending = False
             if self._state_store and self._service_name:
-                self._state_store.clear_key_failure_and_record_success(
+                return self._state_store.clear_key_failure_and_record_success(
                     self._service_name,
                     key,
                 )
+            return None
 
     async def mark_retest_success(self, key: str) -> None:
         """自动复测成功后恢复密钥，但不把复测请求计入业务成功次数。"""

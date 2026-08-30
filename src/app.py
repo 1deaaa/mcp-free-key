@@ -85,6 +85,9 @@ def create_app(
             """周期性领取冷却到期密钥并执行自动复测。"""
             while True:
                 try:
+                    restored = state["key_state_store"].rollover_monthly_state()
+                    if restored:
+                        logger.info("UTC 月初自动恢复额度型密钥：%d 把", restored)
                     engine: ProxyEngine | None = state.get("engine")
                     if engine is not None:
                         await engine.retest_expired_keys()
