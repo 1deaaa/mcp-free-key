@@ -1,1826 +1,1723 @@
 # -*- coding: utf-8 -*-
-"""MCP 聚合网关配置编辑器 - CustomTkinter 重构版。
+"""MCP 聚合网关配置管理器 - Flet 0.28.3 现代重构版。
 
-功能：
-- 编辑网关端口、统一访问密钥。
-- 增删改 MCP 服务（上游 URL、密钥注入方式、失败特征）。
-- 批量添加密钥、自动去重。
-- 测试选中/全部密钥是否有效且有额度。
+功能特性：
+1. 架构彻底解耦：界面由 GatewayAppUI 负责，纯业务逻辑封装在 src.gateway_manager.GatewayManager。
+2. 现代响应式工作台布局：
+   - 顶部：网关全局参数、实时运行健康状态灯、快捷重启/应用
+   - 左侧：服务列表导航卡片，附带启用状态、密钥总数、失效角标
+   - 右侧：多标签页设计（密钥池管理、上游服务配置、多客户端 MCP JSON 生成、实时控制台日志）
+3. 丰富交互体验：
+   - 密钥列表支持搜索筛选、全选/反选、卡片化状态标记（正常/冷却/禁用/复测）、单键快捷测试/恢复/复制/删除
+   - 批量导入、并发测试结果、额度快照、原始错误报文统一采用现代模态弹窗（AlertDialog）
+   - 统一使用 page.open() / page.close()，完全兼容 Flet 0.28.x API
+4. 保持双击启动：直接双击 gui.pyw 即可静默启动无黑框窗口。
 """
 from __future__ import annotations
 
 import asyncio
 import ctypes
-import json
 import os
-import subprocess
 import sys
 import threading
 import time
-import tkinter as tk
-import tkinter.font as tkfont
-from pathlib import Path
-from tkinter import filedialog, messagebox
+from typing import Any, Callable
 
-import customtkinter as ctk
+import flet as ft
 
 from src.config import (
-    DEFAULT_CONFIG_PATH,
-    DEFAULT_KEY_COOLDOWN_SECONDS,
-    GatewayConfig,
-    KeyAuthConfig,
     ROUTING_MODE_PRIMARY_BACKUP,
     ROUTING_MODE_ROUND_ROBIN,
     ServiceConfig,
-    dump_config,
-    load_config,
 )
-from src.key_state import KeyStateStore
-from src.providers import UsageSnapshot, get_provider
-from src.validator import validate_keys
+from src.gateway_manager import (
+    APP_TITLE,
+    ROUTING_LABEL_MODES,
+    ROUTING_MODE_LABELS,
+    GatewayManager,
+    KeyDisplayItem,
+    split_lines,
+)
+from src.providers import UsageSnapshot
+from src.validator import ValidationResult
 
-# ── 主题 ──────────────────────────────────────────────────────────────────────
-ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("blue")
+# ── 现代暗色调色板 ───────────────────────────────────────────────────────────
+CLR_BG = "#0f172a"          # Slate 900
+CLR_SIDEBAR = "#1e293b"     # Slate 800
+CLR_CARD = "#1e293b"        # Slate 800
+CLR_CARD_ACTIVE = "#283548" # Slate 750
+CLR_BORDER = "#334155"      # Slate 700
+CLR_ACCENT = "#3b82f6"      # Blue 500
+CLR_SUCCESS = "#10b981"     # Emerald 500
+CLR_WARN = "#f59e0b"        # Amber 500
+CLR_ERROR = "#ef4444"       # Red 500
+CLR_TEXT = "#f8fafc"        # Slate 50
+CLR_MUTED = "#94a3b8"       # Slate 400
 
-APP_TITLE = "MCP 聚合网关"
-CONFIG_PATH = Path(DEFAULT_CONFIG_PATH)
-PROJECT_ROOT = CONFIG_PATH.parent
-START_SCRIPT = PROJECT_ROOT / "start.py"
-ROUTING_MODE_LABELS = {
-    ROUTING_MODE_ROUND_ROBIN: "轮询",
-    ROUTING_MODE_PRIMARY_BACKUP: "主备",
-}
-ROUTING_LABEL_MODES = {label: mode for mode, label in ROUTING_MODE_LABELS.items()}
-
-
-def _gateway_python_candidates() -> tuple[Path, ...]:
-    """按项目虚拟环境、当前解释器的顺序返回网关启动解释器。"""
+# ── 跨平台字体兼容处理 ─────────────────────────────────────────────────────────
+def resolve_ui_font_family() -> str:
+    """解析系统首选 UI 界面字体：
+    - Windows：使用系统标配高质量中文字体“微软雅黑” (Microsoft YaHei)。
+    - Ubuntu Desktop：优先使用官方推荐预装的“Noto Sans CJK SC”及“Ubuntu”字体，并提供文泉驿正黑等安全回退。
+    """
     if sys.platform == "win32":
-        venv_python = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
-    else:
-        venv_python = PROJECT_ROOT / ".venv" / "bin" / "python"
-
-    candidates = [venv_python, Path(sys.executable)]
-    unique: list[Path] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        absolute = str(candidate.absolute())
-        if absolute not in seen:
-            seen.add(absolute)
-            unique.append(Path(absolute))
-    return tuple(unique)
-
-# 颜色常量
-CLR_BG       = "#1a1a2e"
-CLR_PANEL    = "#16213e"
-CLR_CARD     = "#0f3460"
-CLR_ACCENT   = "#4f8ef7"
-CLR_ACCENT2  = "#7c3aed"
-CLR_SUCCESS  = "#22c55e"
-CLR_WARN     = "#f59e0b"
-CLR_ERROR    = "#ef4444"
-CLR_TEXT     = "#e2e8f0"
-CLR_MUTED    = "#94a3b8"
-CLR_BORDER   = "#334155"
-CLR_ENTRY_BG = "#1e293b"
-CLR_HOVER    = "#2d4a7a"
-
-# 优先选择包含中文字符的字体，避免 Linux 回退到不完整或过于模糊的字体。
-UI_FONT_CANDIDATES = (
-    "Noto Sans CJK SC",
-    "Source Han Sans SC",
-    "Microsoft YaHei UI",
-    "Microsoft YaHei",
-    "PingFang SC",
-    "WenQuanYi Zen Hei",
-    "FangSong Ti",
-    "Song Ti",
-    "Mincho",
-    "SimHei",
-    "Droid Sans Fallback",
-    "DejaVu Sans",
-)
-MONO_FONT_CANDIDATES = (
-    "Noto Sans Mono CJK SC",
-    "Sarasa Mono SC",
-    "Source Han Mono SC",
-    "WenQuanYi Zen Hei Mono",
-    "FangSong Ti",
-    "Song Ti",
-    "Mincho",
-    "Cascadia Mono",
-    "Consolas",
-    "DejaVu Sans Mono",
-)
-FONT_SCALE = 1.6
+        return "Microsoft YaHei, Segoe UI, sans-serif"
+    elif sys.platform.startswith("linux"):
+        return "Noto Sans CJK SC, Ubuntu, Source Han Sans SC, WenQuanYi Zen Hei, sans-serif"
+    elif sys.platform == "darwin":
+        return "PingFang SC, -apple-system, sans-serif"
+    return "sans-serif"
 
 
-def select_font_family(
-    available_families: tuple[str, ...],
-    candidates: tuple[str, ...],
-    fallback: str,
-) -> str:
-    """从当前系统字体中选择第一个匹配的字体族。"""
-    available = {family.casefold(): family for family in available_families}
-    for candidate in candidates:
-        selected = available.get(candidate.casefold())
-        if selected:
-            return selected
-    return fallback
+def resolve_mono_font_family() -> str:
+    """解析系统首选等宽代码字体：
+    - Windows：使用 Consolas / Cascadia Mono。
+    - Ubuntu Desktop：使用 Ubuntu 标配的 Ubuntu Mono / Noto Sans Mono CJK SC。
+    """
+    if sys.platform == "win32":
+        return "Consolas, Cascadia Mono, monospace"
+    elif sys.platform.startswith("linux"):
+        return "Ubuntu Mono, Noto Sans Mono CJK SC, DejaVu Sans Mono, monospace"
+    return "monospace"
 
 
-def _resolve_font_families(root: tk.Misc) -> tuple[str, str]:
-    """解析界面字体和等宽字体，兼容不同操作系统的字体安装情况。"""
-    available = tuple(tkfont.families(root))
-    ui_fallback = str(tkfont.nametofont("TkDefaultFont", root).actual("family"))
-    mono_fallback = str(tkfont.nametofont("TkFixedFont", root).actual("family"))
-    return (
-        select_font_family(available, UI_FONT_CANDIDATES, ui_fallback),
-        select_font_family(available, MONO_FONT_CANDIDATES, mono_fallback),
-    )
+class GatewayAppUI:
+    """Flet 界面控制器与组件构建器。"""
 
+    def __init__(self, page: ft.Page, manager: GatewayManager | None = None) -> None:
+        self.page = page
+        self.manager = manager or GatewayManager()
+        self.current_service_index = 0 if self.manager.config.services else -1
+        self.selected_keys: set[str] = set()
+        self.search_filter: str = ""
+        self.status_filter: str = "all"  # "all", "normal", "disabled"
 
-def dedupe_keep_order(values: list[str]) -> list[str]:
-    """去重并保持原顺序。"""
-    seen: set[str] = set()
-    result: list[str] = []
-    for v in values:
-        item = v.strip()
-        if not item or item in seen:
-            continue
-        seen.add(item)
-        result.append(item)
-    return result
+        self._auto_apply_timer: threading.Timer | None = None
+        self._key_state_mtime: int | None = None
+        self._poll_running = True
 
+        # 构建所有控件实例
+        self._init_controls()
+        self._build_layout()
+        self._load_data()
+        self._start_background_polling()
 
-def split_lines(text: str) -> list[str]:
-    """按行拆分并去重。"""
-    return dedupe_keep_order(text.replace("\r", "").split("\n"))
-
-
-# ── 主窗口 ────────────────────────────────────────────────────────────────────
-class GatewayEditor:
-    """图形界面主控制器。"""
-
-    def __init__(self, root: ctk.CTk) -> None:
-        self.root = root
-        self.root.title(APP_TITLE)
-        self.root.geometry("1280x800")
-        self.root.minsize(1100, 700)
-        self.ui_font_family, self.mono_font_family = _resolve_font_families(root)
-        self._server_process: subprocess.Popen | None = None
-        self._suspend_auto_apply = True
-        self._auto_apply_after_id: str | None = None
-        self._auto_apply_generation = 0
-        self._auto_apply_inflight = False
-        self._key_state_poll_after_id: str | None = None
-        self._key_state_mtime_ns: int | None = None
-
-        # 实例级缓存（避免类变量在多实例间共享）
-        self._stats_cache: dict = {}
-        self._stats_cache_time: float = 0.0
-        self._usage_cache: dict[tuple[str, str], UsageSnapshot] = {}
-        self._restored_keys: set[tuple[str, str]] = set()  # (svc_name, key) 近期手动恢复的密钥
-        self.state_store = KeyStateStore()
-
-        self.config = load_config(str(CONFIG_PATH), strict=False)
-        self.current_index = 0 if self.config.services else -1
-        self._runtime_port = self.config.gateway.port
-        self._runtime_access_key = self.config.gateway.access_keys[0] if self.config.gateway.access_keys else ""
-
-        self._build_ui()
-        self._load_gateway()
-        self._refresh_service_list(select_index=self.current_index)
-        self._suspend_auto_apply = False
-        self._schedule_key_state_poll()
-
-    def _ui_font(self, size: int, weight: str = "normal") -> ctk.CTkFont:
-        """创建使用系统中文字体的 CustomTkinter 字体。"""
-        return ctk.CTkFont(
-            family=self.ui_font_family,
-            size=max(10, round(size * FONT_SCALE)),
-            weight=weight,
+    # ── 控件初始化 ────────────────────────────────────────────────────────────
+    def _init_controls(self) -> None:
+        """初始化输入、选择与状态控件。"""
+        # 顶部网关配置控件
+        self.port_input = ft.TextField(
+            label="网关端口",
+            dense=True,
+            width=90,
+            text_size=12,
+            border_color=CLR_BORDER,
+            on_change=self._on_gateway_setting_change,
+        )
+        self.access_key_input = ft.TextField(
+            label="统一访问密钥",
+            dense=True,
+            width=180,
+            password=True,
+            can_reveal_password=True,
+            text_size=12,
+            border_color=CLR_BORDER,
+            on_change=self._on_gateway_setting_change,
+        )
+        self.routing_mode_dropdown = ft.Dropdown(
+            label="路由模式",
+            dense=True,
+            width=110,
+            text_size=12,
+            border_color=CLR_BORDER,
+            options=[
+                ft.dropdown.Option("轮询", "轮询均衡"),
+                ft.dropdown.Option("主备", "主备优先"),
+            ],
+            on_change=self._on_gateway_setting_change,
+        )
+        self.cooldown_input = ft.TextField(
+            label="冷却(s)",
+            dense=True,
+            width=80,
+            text_size=12,
+            border_color=CLR_BORDER,
+            on_change=self._on_gateway_setting_change,
+        )
+        self.retries_input = ft.TextField(
+            label="重试次数",
+            dense=True,
+            width=80,
+            text_size=12,
+            border_color=CLR_BORDER,
+            on_change=self._on_gateway_setting_change,
+        )
+        self.timeout_input = ft.TextField(
+            label="超时(s)",
+            dense=True,
+            width=80,
+            text_size=12,
+            border_color=CLR_BORDER,
+            on_change=self._on_gateway_setting_change,
+        )
+        self.auto_apply_switch = ft.Switch(
+            label="自动保存应用",
+            value=True,
+            label_position=ft.LabelPosition.LEFT,
         )
 
-    def _tk_font(self, family: str, size: int) -> tuple[str, int]:
-        """创建与界面字号统一的 Tk 原生字体。"""
-        return family, max(10, round(size * FONT_SCALE))
-
-    def _set_modal(self, dialog: ctk.CTkToplevel) -> None:
-        """在弹窗可见后设置模态，兼容 Linux Tk 的映射时序。"""
-        dialog.transient(self.root)
-        try:
-            dialog.update_idletasks()
-            dialog.deiconify()
-        except tk.TclError:
-            return
-        self._grab_when_viewable(dialog)
-
-    def _grab_when_viewable(self, dialog: ctk.CTkToplevel) -> None:
-        """等待窗口真正映射后再抢占输入焦点。"""
-        try:
-            if not dialog.winfo_exists():
-                return
-            if dialog.winfo_viewable():
-                dialog.grab_set()
-                dialog.focus_set()
-                return
-            dialog.after(30, lambda: self._grab_when_viewable(dialog))
-        except tk.TclError:
-            # 用户在窗口映射前关闭弹窗时无需再处理。
-            return
-
-    # ── 布局构建 ──────────────────────────────────────────────────────────────
-    def _build_ui(self) -> None:
-        self.root.grid_columnconfigure(0, weight=1)
-        self.root.grid_rowconfigure(0, weight=1)
-
-        # 最外层容器
-        outer = ctk.CTkFrame(self.root, fg_color=CLR_BG, corner_radius=0)
-        outer.grid(row=0, column=0, sticky="nsew")
-        outer.grid_columnconfigure(0, weight=1)
-        outer.grid_rowconfigure(1, weight=1)
-
-        self._build_header(outer)
-        self._build_body(outer)
-
-    def _build_header(self, parent) -> None:
-        """顶部标题栏 + 网关设置（单行紧凑布局）。"""
-        header = ctk.CTkFrame(parent, fg_color=CLR_PANEL, corner_radius=0, height=96)
-        header.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
-        header.grid_columnconfigure(0, weight=1)
-        header.grid_propagate(False)
-
-        # 左侧品牌标题（紧凑单行）
-        title_box = ctk.CTkFrame(header, fg_color="transparent")
-        title_box.grid(row=0, column=0, sticky="w", padx=(16, 20), pady=(8, 0))
-        ctk.CTkLabel(title_box, text="⚡ MCP Gateway",
-                     font=self._ui_font(16, "bold"),
-                     text_color=CLR_ACCENT).pack(side="left", padx=(0, 8))
-        ctk.CTkLabel(title_box, text="聚合网关配置管理器",
-                     font=self._ui_font(11),
-                     text_color=CLR_MUTED).pack(side="left")
-
-        # 右侧：所有网关参数一行排列
-        gw_box = ctk.CTkFrame(header, fg_color="transparent")
-        gw_box.grid(row=1, column=0, sticky="ew", padx=16, pady=(2, 8))
-        self._build_gateway_fields(gw_box)
-
-    def _build_gateway_fields(self, parent) -> None:
-        """网关参数输入区（单行）。"""
-        self.port_var     = ctk.StringVar()
-        self.gw_key_var   = ctk.StringVar()
-        self.cooldown_var = ctk.StringVar()
-        self.ttl_var      = ctk.StringVar()
-        self.retry_var    = ctk.StringVar()
-        self.timeout_var  = ctk.StringVar()
-        self.routing_mode_var = ctk.StringVar(value=ROUTING_MODE_LABELS[ROUTING_MODE_ROUND_ROBIN])
-
-        # 全部参数一行
-        self._lbl_entry(parent, "端口", self.port_var, width=70)
-        self._lbl_entry(parent, "访问密钥", self.gw_key_var, width=260)
-        self._lbl_entry(parent, "冷却(秒)", self.cooldown_var, width=70)
-        self._lbl_entry(parent, "TTL(秒)", self.ttl_var, width=70)
-        self._lbl_entry(parent, "转移次数", self.retry_var, width=70)
-        self._lbl_entry(parent, "超时(秒)", self.timeout_var, width=70)
-        ctk.CTkLabel(parent, text="路由模式", font=self._ui_font(12),
-                     text_color=CLR_MUTED).pack(side="left", padx=(0, 4))
-        mode_combo = ctk.CTkComboBox(
-            parent,
-            variable=self.routing_mode_var,
-            values=list(ROUTING_LABEL_MODES),
-            state="readonly",
-            width=100,
-            fg_color=CLR_ENTRY_BG,
-            border_color=CLR_ACCENT,
-            text_color=CLR_TEXT,
-            font=self._ui_font(12),
+        # 状态指示灯与文字
+        self.status_indicator = ft.Container(
+            width=10,
+            height=10,
+            border_radius=5,
+            bgcolor=ft.Colors.GREY_500,
         )
-        mode_combo.pack(side="left", padx=(0, 0))
-        self._add_tooltip(mode_combo, "轮询：各密钥均衡使用；主备：优先使用列表第一把可用密钥")
-        for variable in (
-            self.port_var,
-            self.gw_key_var,
-            self.cooldown_var,
-            self.ttl_var,
-            self.retry_var,
-            self.timeout_var,
-            self.routing_mode_var,
-        ):
-            self._watch_variable(variable)
+        self.status_text = ft.Text(
+            "检测中...",
+            size=12,
+            color=CLR_MUTED,
+            weight=ft.FontWeight.W_500,
+        )
 
-    def _lbl_entry(self, parent, label: str, var: ctk.StringVar, width: int = 120) -> None:
-        """标签 + 输入框组合（横向排列）。"""
-        ctk.CTkLabel(parent, text=label, font=self._ui_font(12),
-                     text_color=CLR_MUTED).pack(side="left", padx=(0, 4))
-        ctk.CTkEntry(parent, textvariable=var, width=width,
-                     fg_color=CLR_ENTRY_BG, border_color=CLR_BORDER,
-                     text_color=CLR_TEXT, font=self._ui_font(12)).pack(side="left", padx=(0, 16))
+        # 左侧服务列表容器
+        self.services_listview = ft.ListView(
+            spacing=8,
+            padding=ft.padding.only(top=4, bottom=8),
+            expand=True,
+        )
 
-    def _watch_variable(self, variable) -> None:
-        """监听配置变量，修改后通过统一防抖入口自动应用。"""
-        variable.trace_add("write", self._on_setting_changed)
+        # 统计看板紧凑文字
+        self.stat_total_val = ft.Text("0", size=11, weight=ft.FontWeight.BOLD, color=CLR_TEXT)
+        self.stat_healthy_val = ft.Text("0", size=11, weight=ft.FontWeight.BOLD, color=CLR_SUCCESS)
+        self.stat_disabled_val = ft.Text("0", size=11, weight=ft.FontWeight.BOLD, color=CLR_ERROR)
+        self.stat_success_val = ft.Text("0", size=11, weight=ft.FontWeight.BOLD, color=CLR_ACCENT)
 
-    def _on_setting_changed(self, *_args) -> None:
-        """处理输入变量变化，并刷新会随网关设置变化的示例。"""
-        if self._suspend_auto_apply:
+        # 密钥池筛选与操作栏控件
+        self.search_input = ft.TextField(
+            prefix_icon=ft.Icons.SEARCH,
+            hint_text="搜索密钥前缀/尾号...",
+            dense=True,
+            width=200,
+            text_size=12,
+            border_color=CLR_BORDER,
+            on_change=self.handle_search_change,
+        )
+        self.filter_dropdown = ft.Dropdown(
+            dense=True,
+            width=110,
+            text_size=12,
+            value="all",
+            border_color=CLR_BORDER,
+            options=[
+                ft.dropdown.Option("all", "全部状态"),
+                ft.dropdown.Option("normal", "仅正常"),
+                ft.dropdown.Option("disabled", "仅失效/冷却"),
+            ],
+            on_change=self.handle_filter_change,
+        )
+        self.select_all_cb = ft.Checkbox(
+            label="全选",
+            value=False,
+            on_change=self.handle_select_all_toggle,
+        )
+
+        # 密钥列表容器
+        self.keys_listview = ft.ListView(
+            spacing=6,
+            padding=ft.padding.all(6),
+            expand=True,
+        )
+
+        # 服务参数配置控件
+        self.svc_name_input = ft.TextField(
+            label="服务唯一标识 (Name)",
+            dense=True,
+            text_size=12,
+            read_only=True,
+            border_color=CLR_BORDER,
+        )
+        self.svc_enabled_switch = ft.Switch(
+            label="启用该 MCP 服务",
+            value=True,
+            on_change=self._on_service_field_change,
+        )
+        self.svc_url_input = ft.TextField(
+            label="上游目标 URL",
+            dense=True,
+            text_size=12,
+            border_color=CLR_BORDER,
+            on_change=self._on_service_field_change,
+        )
+        self.key_auth_enabled_switch = ft.Switch(
+            label="启用密钥自动轮询注入",
+            value=True,
+            on_change=self._on_service_field_change,
+        )
+        self.key_type_dropdown = ft.Dropdown(
+            label="注入位置",
+            dense=True,
+            width=120,
+            text_size=12,
+            border_color=CLR_BORDER,
+            options=[
+                ft.dropdown.Option("header", "Header (请求头)"),
+                ft.dropdown.Option("query", "Query (URL 参数)"),
+            ],
+            on_change=self._on_service_field_change,
+        )
+        self.key_param_input = ft.TextField(
+            label="认证参数名 (如 Authorization 或 key)",
+            dense=True,
+            text_size=12,
+            border_color=CLR_BORDER,
+            on_change=self._on_service_field_change,
+        )
+        self.patterns_input = ft.TextField(
+            label="上游失败特征列表 (每行一条关键字或正则)",
+            multiline=True,
+            min_lines=5,
+            max_lines=9,
+            text_size=12,
+            text_style=ft.TextStyle(font_family=resolve_mono_font_family()),
+            border_color=CLR_BORDER,
+            on_change=self._on_service_field_change,
+        )
+
+        # 客户端配置与日志控件
+        self.mcp_client_type = "claude"
+        self.mcp_config_display = ft.TextField(
+            multiline=True,
+            min_lines=10,
+            max_lines=16,
+            read_only=True,
+            text_size=11,
+            text_style=ft.TextStyle(font_family=resolve_mono_font_family()),
+            border_color=CLR_BORDER,
+        )
+        self.log_listview = ft.ListView(
+            spacing=4,
+            padding=ft.padding.all(8),
+            auto_scroll=True,
+            expand=True,
+        )
+
+    # ── 界面布局搭建 ──────────────────────────────────────────────────────────
+    def _build_layout(self) -> None:
+        """组装整体 Flet 界面结构。"""
+        # 顶部品牌与控制栏
+        top_bar = self._build_top_bar()
+
+        # 左侧服务列表侧边栏
+        sidebar = self._build_sidebar()
+
+        # 右侧主工作区
+        workspace = self._build_workspace()
+
+        # 组装到页面根容器
+        body_row = ft.Row(
+            controls=[sidebar, ft.VerticalDivider(width=1, color=CLR_BORDER), workspace],
+            expand=True,
+            spacing=0,
+        )
+
+        self.page.add(
+            ft.Container(
+                content=ft.Column(
+                    controls=[top_bar, ft.Divider(height=1, color=CLR_BORDER), body_row],
+                    spacing=0,
+                    expand=True,
+                ),
+                expand=True,
+                bgcolor=CLR_BG,
+            )
+        )
+
+    def _build_top_bar(self) -> ft.Container:
+        """构建现代顶部导航栏与网关快捷设置。"""
+        brand = ft.Row(
+            controls=[
+                ft.Icon(ft.Icons.HUB_ROUNDED, color=CLR_ACCENT, size=26),
+                ft.Column(
+                    controls=[
+                        ft.Text(APP_TITLE, size=15, weight=ft.FontWeight.BOLD, color=CLR_TEXT),
+                        ft.Row(
+                            controls=[
+                                self.status_indicator,
+                                self.status_text,
+                            ],
+                            spacing=6,
+                        ),
+                    ],
+                    spacing=2,
+                ),
+            ],
+            spacing=10,
+        )
+
+        settings_row = ft.Row(
+            controls=[
+                self.port_input,
+                self.access_key_input,
+                self.routing_mode_dropdown,
+                self.cooldown_input,
+                self.retries_input,
+                self.timeout_input,
+            ],
+            spacing=8,
+            scroll=ft.ScrollMode.AUTO,
+        )
+
+        actions_row = ft.Row(
+            controls=[
+                self.auto_apply_switch,
+                ft.ElevatedButton(
+                    "重启服务",
+                    icon=ft.Icons.REFRESH_ROUNDED,
+                    style=ft.ButtonStyle(
+                        bgcolor=ft.Colors.AMBER_800,
+                        color=ft.Colors.WHITE,
+                    ),
+                    on_click=self.handle_restart_gateway,
+                ),
+                ft.FilledButton(
+                    "立即应用",
+                    icon=ft.Icons.CHECK_ROUNDED,
+                    style=ft.ButtonStyle(bgcolor=CLR_ACCENT),
+                    on_click=self.handle_save_config,
+                ),
+            ],
+            spacing=8,
+        )
+
+        return ft.Container(
+            content=ft.Row(
+                controls=[brand, settings_row, actions_row],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            padding=ft.padding.symmetric(horizontal=16, vertical=10),
+            bgcolor=CLR_SIDEBAR,
+        )
+
+    def _build_sidebar(self) -> ft.Container:
+        """构建左侧服务导航栏（含添加/删除第三方 MCP 操作）。"""
+        header = ft.Row(
+            controls=[
+                ft.Row(
+                    controls=[
+                        ft.Icon(ft.Icons.LIST_ALT_ROUNDED, color=CLR_ACCENT, size=18),
+                        ft.Text("服务列表", size=13, weight=ft.FontWeight.BOLD, color=CLR_TEXT),
+                    ],
+                    spacing=6,
+                ),
+                ft.Row(
+                    controls=[
+                        ft.IconButton(
+                            icon=ft.Icons.ADD_CIRCLE_OUTLINE_ROUNDED,
+                            icon_color=CLR_SUCCESS,
+                            tooltip="添加第三方 MCP 服务",
+                            icon_size=18,
+                            on_click=self.handle_add_service,
+                        ),
+                        ft.IconButton(
+                            icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
+                            icon_color=CLR_ERROR,
+                            tooltip="删除当前选中的服务",
+                            icon_size=18,
+                            on_click=self.handle_delete_service,
+                        ),
+                    ],
+                    spacing=2,
+                ),
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+        )
+
+        return ft.Container(
+            content=ft.Column(
+                controls=[header, ft.Divider(height=1, color=CLR_BORDER), self.services_listview],
+                spacing=8,
+                expand=True,
+            ),
+            width=260,
+            padding=ft.padding.all(12),
+            bgcolor=CLR_SIDEBAR,
+        )
+
+    def _build_workspace(self) -> ft.Container:
+        """构建右侧多标签页工作区。"""
+        # Tab 1: 密钥池管理
+        keys_tab_content = self._build_keys_tab()
+
+        # Tab 2: 服务配置
+        service_tab_content = self._build_service_tab()
+
+        # Tab 3: MCP 客户端配置
+        mcp_tab_content = self._build_mcp_tab()
+
+        # Tab 4: 实时控制台
+        log_tab_content = self._build_log_tab()
+
+        self.tabs = ft.Tabs(
+            selected_index=0,
+            animation_duration=200,
+            tabs=[
+                ft.Tab(
+                    text="密钥池管理",
+                    icon=ft.Icons.VPN_KEY_ROUNDED,
+                    content=keys_tab_content,
+                ),
+                ft.Tab(
+                    text="上游服务参数",
+                    icon=ft.Icons.TUNE_ROUNDED,
+                    content=service_tab_content,
+                ),
+                ft.Tab(
+                    text="客户端配置代码",
+                    icon=ft.Icons.CODE_ROUNDED,
+                    content=mcp_tab_content,
+                ),
+                ft.Tab(
+                    text="运行与测试日志",
+                    icon=ft.Icons.TERMINAL_ROUNDED,
+                    content=log_tab_content,
+                ),
+            ],
+            expand=True,
+        )
+
+        tab_header_trailing = ft.Container(
+            content=ft.Row(
+                controls=[
+                    ft.IconButton(
+                        icon=ft.Icons.REFRESH_ROUNDED,
+                        icon_size=18,
+                        tooltip="快速刷新全部服务与密钥",
+                        on_click=lambda e: self._load_data(),
+                    ),
+                ],
+                spacing=4,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            top=4,
+            right=8,
+        )
+
+        return ft.Container(
+            content=ft.Stack(
+                controls=[
+                    self.tabs,
+                    tab_header_trailing,
+                ],
+                expand=True,
+            ),
+            padding=ft.padding.only(left=12, right=12, top=4, bottom=4),
+            expand=True,
+        )
+
+    def _build_keys_tab(self) -> ft.Container:
+        """构建密钥池标签页（高纵向利用率排版：压缩状态卡片为徽标，按键融入工具栏右侧）。"""
+        def make_stat_badge(icon: str, label: str, val_widget: ft.Text, color: str) -> ft.Container:
+            return ft.Container(
+                content=ft.Row(
+                    controls=[
+                        ft.Icon(icon, size=13, color=color),
+                        ft.Text(label, size=11, color=CLR_MUTED),
+                        val_widget,
+                    ],
+                    spacing=4,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                bgcolor=CLR_CARD,
+                border=ft.border.all(1, CLR_BORDER),
+                border_radius=6,
+                padding=ft.padding.symmetric(horizontal=8, vertical=4),
+            )
+
+        stats_badges = ft.Row(
+            controls=[
+                make_stat_badge(ft.Icons.KEY_ROUNDED, "总数", self.stat_total_val, CLR_TEXT),
+                make_stat_badge(ft.Icons.CHECK_CIRCLE_ROUNDED, "正常", self.stat_healthy_val, CLR_SUCCESS),
+                make_stat_badge(ft.Icons.CANCEL_ROUNDED, "禁用", self.stat_disabled_val, CLR_ERROR),
+                make_stat_badge(ft.Icons.TRENDING_UP_ROUNDED, "本月成功", self.stat_success_val, CLR_ACCENT),
+            ],
+            spacing=6,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+
+        # 工具栏第 1 行：左侧搜索与状态筛选，右侧 4 个高频操作按钮
+        toolbar_row_1 = ft.Row(
+            controls=[
+                ft.Row(
+                    controls=[
+                        self.select_all_cb,
+                        self.search_input,
+                        self.filter_dropdown,
+                    ],
+                    spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                ft.Row(
+                    controls=[
+                        ft.ElevatedButton(
+                            "导入密钥",
+                            icon=ft.Icons.ADD_ROUNDED,
+                            height=32,
+                            style=ft.ButtonStyle(
+                                bgcolor="#0d9488",
+                                color=ft.Colors.WHITE,
+                                padding=ft.padding.symmetric(horizontal=10),
+                            ),
+                            on_click=self.handle_import_keys,
+                        ),
+                        ft.ElevatedButton(
+                            "测试选中",
+                            icon=ft.Icons.PLAY_ARROW_ROUNDED,
+                            height=32,
+                            style=ft.ButtonStyle(
+                                bgcolor="#6366f1",
+                                color=ft.Colors.WHITE,
+                                padding=ft.padding.symmetric(horizontal=10),
+                            ),
+                            on_click=self.handle_test_selected,
+                        ),
+                        ft.ElevatedButton(
+                            "测试全部",
+                            icon=ft.Icons.PLAY_CIRCLE_FILLED_ROUNDED,
+                            height=32,
+                            style=ft.ButtonStyle(
+                                bgcolor="#0284c7",
+                                color=ft.Colors.WHITE,
+                                padding=ft.padding.symmetric(horizontal=10),
+                            ),
+                            on_click=self.handle_test_all,
+                        ),
+                        ft.ElevatedButton(
+                            "查询额度",
+                            icon=ft.Icons.ASSESSMENT_ROUNDED,
+                            height=32,
+                            style=ft.ButtonStyle(
+                                bgcolor="#0f766e",
+                                color=ft.Colors.WHITE,
+                                padding=ft.padding.symmetric(horizontal=10),
+                            ),
+                            on_click=self.handle_query_usage,
+                        ),
+                    ],
+                    spacing=6,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+
+        # 工具栏第 2 行：左侧 4 个紧凑统计徽标，右侧 4 个状态维护按钮
+        toolbar_row_2 = ft.Row(
+            controls=[
+                stats_badges,
+                ft.Row(
+                    controls=[
+                        ft.ElevatedButton(
+                            "恢复选中",
+                            icon=ft.Icons.RESTORE_ROUNDED,
+                            height=32,
+                            style=ft.ButtonStyle(
+                                bgcolor="#166534",
+                                color=ft.Colors.WHITE,
+                                padding=ft.padding.symmetric(horizontal=10),
+                            ),
+                            on_click=self.handle_reset_selected,
+                        ),
+                        ft.ElevatedButton(
+                            "全部恢复",
+                            icon=ft.Icons.RESTORE_PAGE_ROUNDED,
+                            height=32,
+                            style=ft.ButtonStyle(
+                                bgcolor="#15803d",
+                                color=ft.Colors.WHITE,
+                                padding=ft.padding.symmetric(horizontal=10),
+                            ),
+                            on_click=self.handle_reset_all_disabled,
+                        ),
+                        ft.OutlinedButton(
+                            "查看错误",
+                            icon=ft.Icons.ERROR_OUTLINE_ROUNDED,
+                            height=32,
+                            style=ft.ButtonStyle(
+                                padding=ft.padding.symmetric(horizontal=10),
+                            ),
+                            on_click=self.handle_show_raw_errors,
+                        ),
+                        ft.ElevatedButton(
+                            "删除选中",
+                            icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
+                            height=32,
+                            style=ft.ButtonStyle(
+                                bgcolor="#991b1b",
+                                color=ft.Colors.WHITE,
+                                padding=ft.padding.symmetric(horizontal=10),
+                            ),
+                            on_click=self.handle_delete_selected,
+                        ),
+                    ],
+                    spacing=6,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+
+        return ft.Container(
+            content=ft.Column(
+                controls=[
+                    toolbar_row_1,
+                    toolbar_row_2,
+                    ft.Divider(height=1, color=CLR_BORDER),
+                    self.keys_listview,
+                ],
+                spacing=6,
+                expand=True,
+            ),
+            padding=ft.padding.symmetric(vertical=4),
+            expand=True,
+        )
+
+    def _build_service_tab(self) -> ft.Container:
+        """构建上游服务参数配置标签页。"""
+        row1 = ft.Row(
+            controls=[
+                ft.Container(content=self.svc_name_input, expand=1),
+                self.svc_enabled_switch,
+                ft.Container(content=self.svc_url_input, expand=3),
+            ],
+            spacing=16,
+        )
+        row2 = ft.Row(
+            controls=[
+                self.key_auth_enabled_switch,
+                self.key_type_dropdown,
+                ft.Container(content=self.key_param_input, expand=2),
+            ],
+            spacing=16,
+        )
+
+        card = ft.Container(
+            content=ft.Column(
+                controls=[
+                    ft.Text("基础与认证配置", size=14, weight=ft.FontWeight.BOLD, color=CLR_TEXT),
+                    row1,
+                    row2,
+                    ft.Divider(height=1, color=CLR_BORDER),
+                    ft.Text("故障判定特征 (Failure Patterns)", size=14, weight=ft.FontWeight.BOLD, color=CLR_TEXT),
+                    self.patterns_input,
+                ],
+                spacing=12,
+            ),
+            bgcolor=CLR_CARD,
+            border=ft.border.all(1, CLR_BORDER),
+            border_radius=8,
+            padding=ft.padding.all(16),
+        )
+
+        return ft.Container(
+            content=card,
+            padding=ft.padding.symmetric(vertical=12),
+            expand=True,
+        )
+
+    def _build_mcp_tab(self) -> ft.Container:
+        """构建客户端配置代码生成标签页。"""
+        tabs = ft.Row(
+            controls=[
+                ft.ElevatedButton(
+                    "Claude Desktop",
+                    icon=ft.Icons.INTEGRATION_INSTRUCTIONS_ROUNDED,
+                    on_click=lambda e: self._switch_mcp_client("claude"),
+                ),
+                ft.ElevatedButton(
+                    "Cursor / Windsurf",
+                    icon=ft.Icons.TERMINAL_ROUNDED,
+                    on_click=lambda e: self._switch_mcp_client("cursor"),
+                ),
+                ft.FilledButton(
+                    "复制配置 JSON",
+                    icon=ft.Icons.CONTENT_COPY_ROUNDED,
+                    style=ft.ButtonStyle(bgcolor=CLR_ACCENT),
+                    on_click=self.handle_copy_mcp_config,
+                ),
+            ],
+            spacing=10,
+        )
+
+        card = ft.Container(
+            content=ft.Column(
+                controls=[
+                    tabs,
+                    ft.Divider(height=1, color=CLR_BORDER),
+                    self.mcp_config_display,
+                ],
+                spacing=10,
+                expand=True,
+            ),
+            bgcolor=CLR_CARD,
+            border=ft.border.all(1, CLR_BORDER),
+            border_radius=8,
+            padding=ft.padding.all(16),
+            expand=True,
+        )
+
+        return ft.Container(
+            content=card,
+            padding=ft.padding.symmetric(vertical=12),
+            expand=True,
+        )
+
+    def _build_log_tab(self) -> ft.Container:
+        """构建实时日志与测试控制台标签页。"""
+        toolbar = ft.Row(
+            controls=[
+                ft.Text("运行与测试日志输出", size=13, weight=ft.FontWeight.BOLD, color=CLR_TEXT),
+                ft.OutlinedButton(
+                    "清空日志",
+                    icon=ft.Icons.DELETE_SWEEP_ROUNDED,
+                    on_click=self.handle_clear_logs,
+                ),
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+        )
+
+        card = ft.Container(
+            content=ft.Column(
+                controls=[toolbar, ft.Divider(height=1, color=CLR_BORDER), self.log_listview],
+                spacing=8,
+                expand=True,
+            ),
+            bgcolor=CLR_CARD,
+            border=ft.border.all(1, CLR_BORDER),
+            border_radius=8,
+            padding=ft.padding.all(12),
+            expand=True,
+        )
+
+        return ft.Container(
+            content=card,
+            padding=ft.padding.symmetric(vertical=12),
+            expand=True,
+        )
+
+    # ── 数据绑定与刷新 ────────────────────────────────────────────────────────
+    def _load_data(self) -> None:
+        """初始化加载配置与当前服务。"""
+        gw = self.manager.config.gateway
+        self.port_input.value = str(gw.port)
+        self.access_key_input.value = gw.access_keys[0] if gw.access_keys else ""
+        self.routing_mode_dropdown.value = ROUTING_MODE_LABELS.get(gw.routing_mode, "轮询")
+        self.cooldown_input.value = str(gw.key_cooldown_seconds)
+        self.retries_input.value = str(gw.max_failover_retries)
+        self.timeout_input.value = str(gw.upstream_timeout_seconds)
+
+        self.refresh_service_list()
+        if 0 <= self.current_service_index < len(self.manager.config.services):
+            self.load_service(self.current_service_index)
+
+    def load_service(self, index: int) -> None:
+        """将指定服务的配置加载到工作区。"""
+        if not (0 <= index < len(self.manager.config.services)):
             return
+        self.current_service_index = index
+        svc = self.manager.config.services[index]
+
+        self.svc_name_input.value = svc.name
+        self.svc_enabled_switch.value = svc.enabled
+        self.svc_url_input.value = svc.upstream_url
+        self.key_auth_enabled_switch.value = svc.key_auth.enabled
+        self.key_type_dropdown.value = svc.key_auth.type
+        self.key_param_input.value = svc.key_auth.param
+        self.patterns_input.value = "\n".join(svc.failure_patterns)
+
+        self.selected_keys.clear()
+        self.select_all_cb.value = False
+        self.refresh_keys_list()
+        self._refresh_mcp_config()
+        self.refresh_service_list()
+        self.page.update()
+
+    def refresh_service_list(self) -> None:
+        """刷新左侧服务卡片列表。"""
+        self.services_listview.controls.clear()
+        for i, svc in enumerate(self.manager.config.services):
+            is_active = i == self.current_service_index
+            keys_count = len(svc.keys)
+
+            # 统计失效键
+            items = self.manager.get_key_display_items(i)
+            disabled_count = sum(1 for it in items if it.status_type != "normal")
+
+            badge_color = CLR_SUCCESS if disabled_count == 0 else CLR_ERROR
+            badge_text = f"{keys_count} 键" if disabled_count == 0 else f"{keys_count} 键 ({disabled_count} 失效)"
+
+            def make_click_handler(idx: int):
+                return lambda e: self.load_service(idx)
+
+            card = ft.Container(
+                content=ft.Row(
+                    controls=[
+                        ft.Icon(
+                            ft.Icons.RADIO_BUTTON_CHECKED_ROUNDED if is_active else ft.Icons.CIRCLE_OUTLINED,
+                            color=CLR_ACCENT if is_active else CLR_MUTED,
+                            size=16,
+                        ),
+                        ft.Column(
+                            controls=[
+                                ft.Text(
+                                    svc.name,
+                                    size=13,
+                                    weight=ft.FontWeight.BOLD if is_active else ft.FontWeight.NORMAL,
+                                    color=CLR_TEXT,
+                                ),
+                                ft.Text(
+                                    badge_text,
+                                    size=10,
+                                    color=badge_color,
+                                ),
+                            ],
+                            spacing=1,
+                            expand=True,
+                        ),
+                        ft.Switch(
+                            value=svc.enabled,
+                            scale=0.7,
+                            on_change=lambda e, idx=i: self._on_service_toggle(idx, e.control.value),
+                        ),
+                    ],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                ),
+                padding=ft.padding.symmetric(horizontal=10, vertical=8),
+                bgcolor=CLR_CARD_ACTIVE if is_active else ft.Colors.TRANSPARENT,
+                border=ft.border.all(1, CLR_ACCENT if is_active else CLR_BORDER),
+                border_radius=8,
+                on_click=make_click_handler(i),
+            )
+            self.services_listview.controls.append(card)
+
+    def refresh_keys_list(self) -> None:
+        """根据搜索与状态过滤器渲染当前服务的密钥列表。"""
+        self.keys_listview.controls.clear()
+        if not (0 <= self.current_service_index < len(self.manager.config.services)):
+            self.page.update()
+            return
+
+        items = self.manager.get_key_display_items(self.current_service_index)
+
+        # 更新看板数据
+        total = len(items)
+        healthy = sum(1 for it in items if it.status_type == "normal")
+        disabled = sum(1 for it in items if it.status_type != "normal")
+        total_success = sum(it.monthly_success_count for it in items)
+
+        self.stat_total_val.value = str(total)
+        self.stat_healthy_val.value = str(healthy)
+        self.stat_disabled_val.value = str(disabled)
+        self.stat_success_val.value = str(total_success)
+
+        # 过滤数据
+        filtered_items: list[KeyDisplayItem] = []
+        for it in items:
+            if self.search_filter:
+                sf = self.search_filter.lower()
+                if sf not in it.key.lower():
+                    continue
+            if self.status_filter == "normal" and it.status_type != "normal":
+                continue
+            if self.status_filter == "disabled" and it.status_type == "normal":
+                continue
+            filtered_items.append(it)
+
+        if not filtered_items:
+            self.keys_listview.controls.append(
+                ft.Container(
+                    content=ft.Text("暂无匹配的密钥记录", color=CLR_MUTED, size=12),
+                    alignment=ft.alignment.center,
+                    padding=ft.padding.all(30),
+                )
+            )
+            self.page.update()
+            return
+
+        for it in filtered_items:
+            k = it.key
+            is_checked = k in self.selected_keys
+
+            # 状态芯片颜色与标签
+            chip_color = CLR_SUCCESS
+            if it.status_type == "cooldown":
+                chip_color = CLR_WARN
+            elif it.status_type == "disabled":
+                chip_color = CLR_ERROR
+            elif it.status_type == "retest":
+                chip_color = "#f97316"
+
+            def make_checkbox_handler(key_val: str):
+                return lambda e: self.toggle_key_selection(key_val, e.control.value)
+
+            def make_copy_handler(key_val: str):
+                return lambda e: self._copy_text(key_val, "密钥已复制到剪贴板")
+
+            def make_single_test_handler(key_val: str):
+                return lambda e: self.handle_single_key_test(key_val)
+
+            def make_single_restore_handler(key_val: str):
+                return lambda e: self.handle_single_key_restore(key_val)
+
+            def make_single_delete_handler(key_val: str):
+                return lambda e: self.handle_single_key_delete(key_val)
+
+            card_row = ft.Row(
+                controls=[
+                    ft.Checkbox(
+                        value=is_checked,
+                        on_change=make_checkbox_handler(k),
+                    ),
+                    ft.Container(
+                        content=ft.Row(
+                            controls=[
+                                ft.Text(it.display_key, size=12, weight=ft.FontWeight.W_500, color=CLR_TEXT),
+                                ft.IconButton(
+                                    icon=ft.Icons.COPY_ROUNDED,
+                                    icon_size=14,
+                                    tooltip="复制完整密钥",
+                                    on_click=make_copy_handler(k),
+                                ),
+                            ],
+                            spacing=2,
+                        ),
+                        width=220,
+                    ),
+                    ft.Container(
+                        content=ft.Text(it.status_str, size=10, color=chip_color, weight=ft.FontWeight.BOLD),
+                        padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                        border=ft.border.all(1, chip_color),
+                        border_radius=6,
+                    ),
+                    ft.Text(f"本月成功: {it.monthly_success_count}", size=11, color=CLR_MUTED),
+                    ft.Text(it.quota_info or "", size=11, color=CLR_ACCENT) if it.quota_info else ft.Container(),
+                    ft.Row(
+                        controls=[
+                            ft.IconButton(
+                                icon=ft.Icons.PLAY_ARROW_ROUNDED,
+                                icon_color=CLR_ACCENT,
+                                tooltip="测试此密钥",
+                                on_click=make_single_test_handler(k),
+                            ),
+                            ft.IconButton(
+                                icon=ft.Icons.RESTORE_ROUNDED,
+                                icon_color=CLR_SUCCESS,
+                                tooltip="恢复此密钥",
+                                on_click=make_single_restore_handler(k),
+                            ),
+                            ft.IconButton(
+                                icon=ft.Icons.DELETE_ROUNDED,
+                                icon_color=CLR_ERROR,
+                                tooltip="删除此密钥",
+                                on_click=make_single_delete_handler(k),
+                            ),
+                        ],
+                        spacing=2,
+                    ),
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            )
+
+            item_card = ft.Container(
+                content=card_row,
+                padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                bgcolor=CLR_CARD,
+                border=ft.border.all(1, CLR_BORDER),
+                border_radius=8,
+            )
+            self.keys_listview.controls.append(item_card)
+
+    def _refresh_mcp_config(self) -> None:
+        """刷新 MCP 配置展示。"""
+        if not (0 <= self.current_service_index < len(self.manager.config.services)):
+            self.mcp_config_display.value = "{}"
+            return
+        svc = self.manager.config.services[self.current_service_index]
+        self.mcp_config_display.value = self.manager.generate_mcp_config(
+            svc.name, self.mcp_client_type
+        )
+
+    def _switch_mcp_client(self, client_type: str) -> None:
+        self.mcp_client_type = client_type
+        self._refresh_mcp_config()
+        self.page.update()
+
+    # ── 交互事件处理 ──────────────────────────────────────────────────────────
+    def _on_gateway_setting_change(self, e=None) -> None:
+        """网关配置变化时同步并调度防抖自动应用。"""
         self._schedule_auto_apply()
-        if (
-            hasattr(self, "mcp_example_text")
-            and 0 <= self.current_index < len(self.config.services)
-        ):
-            self._refresh_mcp_example(self.config.services[self.current_index])
 
-    def _on_text_setting_changed(self, _event=None):
-        """处理失败特征文本变化。"""
-        self._on_setting_changed()
+    def _on_service_field_change(self, e=None) -> None:
+        """当前服务参数变化时同步。"""
+        if not (0 <= self.current_service_index < len(self.manager.config.services)):
+            return
+        try:
+            self.manager.update_service_config(
+                service_index=self.current_service_index,
+                name=self.svc_name_input.value or "",
+                upstream_url=self.svc_url_input.value or "",
+                enabled=bool(self.svc_enabled_switch.value),
+                key_auth_enabled=bool(self.key_auth_enabled_switch.value),
+                key_type=self.key_type_dropdown.value or "header",
+                key_param=self.key_param_input.value or "",
+                failure_patterns=split_lines(self.patterns_input.value or ""),
+            )
+            self._schedule_auto_apply()
+        except Exception as exc:
+            self.log(f"⚠️ 配置校验警告: {exc}")
+
+    def _on_service_toggle(self, index: int, enabled: bool) -> None:
+        """服务启用开关切换。"""
+        if 0 <= index < len(self.manager.config.services):
+            self.manager.config.services[index].enabled = enabled
+            if index == self.current_service_index:
+                self.svc_enabled_switch.value = enabled
+            self._schedule_auto_apply()
+            self.refresh_service_list()
+            self.page.update()
 
     def _schedule_auto_apply(self) -> None:
-        """防抖调度配置应用，避免连续输入时重复写文件和重载网关。"""
-        if self._suspend_auto_apply:
+        """防抖自动应用。"""
+        if not self.auto_apply_switch.value:
             return
-        self._auto_apply_generation += 1
-        if self._auto_apply_inflight:
-            return
-        if self._auto_apply_after_id is not None:
-            try:
-                self.root.after_cancel(self._auto_apply_after_id)
-            except tk.TclError:
-                pass
-        self._auto_apply_after_id = self.root.after(500, self._auto_apply)
+        if self._auto_apply_timer:
+            self._auto_apply_timer.cancel()
+        self._auto_apply_timer = threading.Timer(0.8, self._auto_apply_worker)
+        self._auto_apply_timer.start()
 
-    def _schedule_key_state_poll(self) -> None:
-        """定期检查共享状态文件，让 GUI 及时显示最新月度次数和状态。"""
-        self._key_state_poll_after_id = self.root.after(250, self._poll_key_state)
-
-    def _poll_key_state(self) -> None:
-        """状态文件发生变化时刷新当前服务的密钥列表。"""
-        self._key_state_poll_after_id = None
+    def _auto_apply_worker(self) -> None:
         try:
-            try:
-                mtime_ns = os.stat(self.state_store.path).st_mtime_ns
-            except FileNotFoundError:
-                mtime_ns = None
-            if mtime_ns != self._key_state_mtime_ns:
-                self._key_state_mtime_ns = mtime_ns
-                if 0 <= self.current_index < len(self.config.services):
-                    self._refresh_keys_list(self.config.services[self.current_index])
-        except (OSError, tk.TclError):
-            return
-        try:
-            self._schedule_key_state_poll()
-        except tk.TclError:
-            pass
-
-    def _build_body(self, parent) -> None:
-        """中部主体：上半区编辑，下半区全宽日志/示例。"""
-        body = ctk.CTkFrame(parent, fg_color="transparent")
-        body.grid(row=1, column=0, sticky="nsew", padx=16, pady=16)
-        body.grid_columnconfigure(0, weight=0, minsize=200)
-        body.grid_columnconfigure(1, weight=1)
-        body.grid_rowconfigure(0, weight=3)
-        body.grid_rowconfigure(1, weight=2, minsize=160)
-
-        self._build_service_list(body)
-        self._build_right_panel(body)
-        self._build_log_panel(body)
-
-    def _build_service_list(self, parent) -> None:
-        """左侧服务列表面板。"""
-        left = ctk.CTkFrame(parent, fg_color=CLR_CARD, corner_radius=8, width=200)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
-        left.grid_propagate(False)
-        left.grid_rowconfigure(1, weight=1)   # 列表行拉伸
-        left.grid_columnconfigure(0, weight=1)
-
-        # 标题
-        ctk.CTkLabel(left, text="📋 服务列表", font=self._ui_font(13, "bold"),
-                     text_color=CLR_ACCENT).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 6))
-
-        # 列表框（不设 width，让 grid 控制宽度）
-        self.svc_listbox = tk.Listbox(left, font=self._tk_font(self.ui_font_family, 11),
-                                      bg=CLR_ENTRY_BG, fg=CLR_TEXT, selectmode="single",
-                                      activestyle="none", relief="flat", bd=0,
-                                      highlightthickness=0,
-                                      selectbackground=CLR_HOVER, selectforeground=CLR_TEXT)
-        self.svc_listbox.grid(row=1, column=0, sticky="nsew", padx=(10, 0), pady=(0, 10))
-        self.svc_listbox.bind("<<ListboxSelect>>", self._on_select)
-
-        # 滚动条
-        scrollbar = tk.Scrollbar(left, command=self.svc_listbox.yview,
-                                 bg=CLR_BORDER, activebackground=CLR_HOVER,
-                                 troughcolor=CLR_ENTRY_BG, width=6, relief="flat")
-        scrollbar.grid(row=1, column=1, sticky="ns", padx=(0, 6), pady=(0, 10))
-        self.svc_listbox.config(yscrollcommand=scrollbar.set)
-
-    def _build_right_panel(self, parent) -> None:
-        """右侧上半区：服务编辑区。"""
-        right = ctk.CTkFrame(parent, fg_color="transparent")
-        right.grid(row=0, column=1, sticky="nsew")
-        right.grid_columnconfigure(0, weight=1)
-        right.grid_rowconfigure(0, weight=1)
-
-        self._build_service_editor(right)
-
-    def _build_service_editor(self, parent) -> None:
-        """服务编辑区。"""
-        editor = ctk.CTkFrame(parent, fg_color=CLR_CARD, corner_radius=8)
-        editor.grid(row=0, column=0, sticky="nsew", padx=0, pady=(0, 12))
-        editor.grid_columnconfigure(0, weight=1)
-        editor.grid_rowconfigure(2, weight=1)
-
-        # ── 标题 + 配置一行
-        hdr = ctk.CTkFrame(editor, fg_color="transparent")
-        hdr.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
-        ctk.CTkLabel(hdr, text="⚙️ 服务详情",
-                    font=self._ui_font(13, "bold"),
-                    text_color=CLR_ACCENT).pack(side="left")
-
-        # 变量声明
-        self.svc_name_var    = ctk.StringVar()
-        self.svc_enabled_var = ctk.BooleanVar(value=True)
-        self.svc_url_var     = ctk.StringVar()
-        self.key_enabled_var = ctk.BooleanVar(value=True)
-        self.key_type_var    = ctk.StringVar(value="header")
-        self.key_param_var   = ctk.StringVar()
-
-        # ── 配置一行：服务名 | 启用 | 上游URL | 密钥轮询 | 注入方式 | 字段名
-        cfg_row = ctk.CTkFrame(editor, fg_color="transparent")
-        cfg_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
-
-        ctk.CTkLabel(cfg_row, text="服务名", text_color=CLR_MUTED,
-                    font=self._ui_font(10)).pack(side="left", padx=(0, 4))
-        ctk.CTkEntry(cfg_row, textvariable=self.svc_name_var, state="readonly",
-                    fg_color=CLR_ENTRY_BG, border_color=CLR_BORDER,
-                    text_color=CLR_TEXT, font=self._ui_font(11),
-                    width=110).pack(side="left", padx=(0, 6))
-        ctk.CTkCheckBox(cfg_row, text="启用", variable=self.svc_enabled_var,
-                       font=self._ui_font(11), text_color=CLR_TEXT,
-                       width=60).pack(side="left", padx=(0, 14))
-        ctk.CTkLabel(cfg_row, text="|", text_color=CLR_BORDER,
-                    font=self._ui_font(13)).pack(side="left", padx=(0, 14))
-        ctk.CTkLabel(cfg_row, text="上游URL", text_color=CLR_MUTED,
-                    font=self._ui_font(10)).pack(side="left", padx=(0, 4))
-        ctk.CTkEntry(cfg_row, textvariable=self.svc_url_var, state="readonly",
-                    fg_color=CLR_ENTRY_BG, border_color=CLR_BORDER,
-                    text_color=CLR_TEXT, font=self._ui_font(11)).pack(
-                    side="left", fill="x", expand=True, padx=(0, 14))
-        ctk.CTkLabel(cfg_row, text="|", text_color=CLR_BORDER,
-                    font=self._ui_font(13)).pack(side="left", padx=(0, 14))
-        ctk.CTkCheckBox(cfg_row, text="密钥轮询", variable=self.key_enabled_var,
-                       font=self._ui_font(11), text_color=CLR_TEXT,
-                       width=80).pack(side="left", padx=(0, 10))
-        ctk.CTkLabel(cfg_row, text="注入方式", text_color=CLR_MUTED,
-                    font=self._ui_font(10)).pack(side="left", padx=(0, 4))
-        type_combo = ctk.CTkComboBox(cfg_row, variable=self.key_type_var,
-                       values=["header", "query"], state="readonly",
-                       fg_color=CLR_ENTRY_BG, border_color=CLR_BORDER,
-                       text_color=CLR_TEXT, font=self._ui_font(10), width=90)
-        type_combo.pack(side="left", padx=(0, 10))
-        self._add_tooltip(type_combo,
-                         "header：密钥通过 HTTP 请求头传递（如 Authorization）\n"
-                         "query ：密钥通过 URL 查询参数传递（如 ?apiKey=xxx）")
-        ctk.CTkLabel(cfg_row, text="字段名", text_color=CLR_MUTED,
-                    font=self._ui_font(10)).pack(side="left", padx=(0, 4))
-        ctk.CTkEntry(cfg_row, textvariable=self.key_param_var,
-                    fg_color=CLR_ENTRY_BG, border_color=CLR_BORDER,
-                    text_color=CLR_TEXT, font=self._ui_font(10),
-                    width=150).pack(side="left")
-
-        # ── 密钥管理 + 失败特征（两列布局）
-        lower = ctk.CTkFrame(editor, fg_color="transparent")
-        lower.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
-        lower.grid_columnconfigure(0, weight=2)  # 密钥列表占 2/3
-        lower.grid_columnconfigure(1, weight=1)  # 失败特征占 1/3
-        lower.grid_rowconfigure(1, weight=1)
-
-        # 左侧：密钥列表
-        keys_lbl = ctk.CTkLabel(lower, text="🔑 密钥状态", font=self._ui_font(11, "bold"),
-                               text_color=CLR_ACCENT)
-        keys_lbl.grid(row=0, column=0, sticky="w", pady=(0, 4))
-        self.key_status_label = ctk.CTkLabel(
-            lower,
-            text="",
-            font=self._ui_font(10),
-            text_color=CLR_MUTED,
-        )
-        self.key_status_label.grid(row=0, column=0, sticky="e", pady=(0, 4))
-
-        self.keys_tree = tk.Listbox(lower, height=6, font=self._tk_font(self.mono_font_family, 10),
-                                   bg=CLR_ENTRY_BG, fg=CLR_TEXT, selectmode="extended",
-                                   activestyle="none", relief="flat", bd=0,
-                                   highlightthickness=0)
-        self.keys_tree.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
-        keys_scroll = tk.Scrollbar(lower, command=self.keys_tree.yview,
-                                  bg=CLR_BORDER, activebackground=CLR_HOVER, width=8)
-        keys_scroll.grid(row=1, column=0, sticky="nse", padx=(0, 0))
-        self.keys_tree.config(yscrollcommand=keys_scroll.set)
-
-        # 右侧：失败特征
-        patterns_lbl = ctk.CTkLabel(lower, text="⚠️ 失败特征", font=self._ui_font(11, "bold"),
-                                   text_color=CLR_ACCENT)
-        patterns_lbl.grid(row=0, column=1, sticky="w", pady=(0, 4))
-
-        self.patterns_text = tk.Text(lower, height=6, width=20, font=self._tk_font(self.mono_font_family, 10),
-                                    bg=CLR_ENTRY_BG, fg=CLR_TEXT, relief="flat", bd=0,
-                                    highlightthickness=0, wrap="none")
-        self.patterns_text.grid(row=1, column=1, sticky="nsew")
-        patterns_scroll = tk.Scrollbar(lower, command=self.patterns_text.yview,
-                                      bg=CLR_BORDER, activebackground=CLR_HOVER, width=8)
-        patterns_scroll.grid(row=1, column=1, sticky="nse")
-        self.patterns_text.config(yscrollcommand=patterns_scroll.set)
-        for variable in (
-            self.svc_enabled_var,
-            self.key_enabled_var,
-            self.key_type_var,
-            self.key_param_var,
-        ):
-            self._watch_variable(variable)
-        self.patterns_text.bind("<KeyRelease>", self._on_text_setting_changed, add="+")
-        self.patterns_text.bind("<FocusOut>", self._on_text_setting_changed, add="+")
-
-        # 操作按钮行（所有编辑均自动应用，不提供单独的保存按钮）
-        btn_row = ctk.CTkFrame(editor, fg_color="transparent")
-        btn_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
-        for i in range(5):
-            btn_row.grid_columnconfigure(i, weight=1)
-
-        ctk.CTkButton(btn_row, text="📥 批量导入密钥", command=self._import_keys,
-                     fg_color="#0d9488", hover_color="#0f766e",
-                     font=self._ui_font(11, "bold")).grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 4))
-        ctk.CTkButton(btn_row, text="🧪 测试选中密钥", command=self._test_selected_keys,
-                     fg_color=CLR_ACCENT2, hover_color="#6d28d9",
-                     font=self._ui_font(11)).grid(row=0, column=1, sticky="ew", padx=4, pady=(0, 4))
-        ctk.CTkButton(btn_row, text="🧪 测试全部密钥", command=self._test_all_keys,
-                     fg_color="#0284c7", hover_color="#0369a1",
-                     font=self._ui_font(11)).grid(row=0, column=2, sticky="ew", padx=4, pady=(0, 4))
-        ctk.CTkButton(btn_row, text="📊 查询额度", command=self._query_selected_usage,
-                     fg_color="#0f766e", hover_color="#115e59",
-                     font=self._ui_font(11)).grid(row=0, column=3, sticky="ew", padx=4, pady=(0, 4))
-        self.restart_button = ctk.CTkButton(
-            btn_row,
-            text="🔄 重启服务",
-            command=self._restart_service,
-            fg_color="#b45309",
-            hover_color="#92400e",
-            font=self._ui_font(11, "bold"),
-        )
-        self.restart_button.grid(row=0, column=4, sticky="ew", padx=(4, 0), pady=(0, 4))
-        ctk.CTkButton(btn_row, text="♻️ 恢复选中", command=self._reset_selected_key_states,
-                     fg_color="#166534", hover_color="#15803d",
-                     font=self._ui_font(11)).grid(row=1, column=0, sticky="ew", padx=(0, 4))
-        ctk.CTkButton(btn_row, text="♻️ 恢复全部失效密钥", command=self._reset_all_disabled_keys,
-                     fg_color="#166534", hover_color="#15803d",
-                     font=self._ui_font(11, "bold")).grid(row=1, column=1, sticky="ew", padx=4)
-        ctk.CTkButton(btn_row, text="查看原始错误", command=self._show_raw_errors,
-                     fg_color="#475569", hover_color="#334155",
-                     font=self._ui_font(11)).grid(row=1, column=2, sticky="ew", padx=4)
-        ctk.CTkButton(btn_row, text="🗑️ 删除选中", command=self._delete_selected_keys,
-                     fg_color="#7f1d1d", hover_color="#991b1b",
-                     font=self._ui_font(11)).grid(row=1, column=3, sticky="ew", padx=4)
-        ctk.CTkButton(btn_row, text="🗑️ 删除全部密钥", command=self._delete_all_keys,
-                     fg_color="#991b1b", hover_color="#b91c1c",
-                     font=self._ui_font(11, "bold")).grid(row=1, column=4, sticky="ew", padx=(4, 0))
-
-    def _build_log_panel(self, parent) -> None:
-        """底部：全宽 MCP 示例 + 测试日志（40/60 分栏）。"""
-        bottom = ctk.CTkFrame(parent, fg_color="transparent")
-        bottom.grid(row=1, column=0, columnspan=2, sticky="nsew")
-        bottom.grid_columnconfigure(0, weight=2)
-        bottom.grid_columnconfigure(1, weight=3)
-        bottom.grid_rowconfigure(0, weight=1)
-        parent.grid_rowconfigure(1, weight=1, minsize=180)
-
-        # 左：MCP 配置示例
-        mcp_frame = ctk.CTkFrame(bottom, fg_color=CLR_CARD, corner_radius=8)
-        mcp_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        mcp_frame.grid_columnconfigure(0, weight=1)
-        mcp_frame.grid_rowconfigure(1, weight=1)
-
-        mcp_hdr = ctk.CTkFrame(mcp_frame, fg_color="transparent")
-        mcp_hdr.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
-        ctk.CTkLabel(mcp_hdr, text="📋 MCP 客户端配置示例", font=self._ui_font(12, "bold"),
-                    text_color=CLR_ACCENT).pack(side="left")
-        ctk.CTkButton(mcp_hdr, text="复制", command=self._copy_mcp_example,
-                     width=60, height=24, fg_color=CLR_ACCENT, hover_color=CLR_HOVER,
-                     font=self._ui_font(10)).pack(side="right")
-
-        self.mcp_example_text = tk.Text(mcp_frame, height=7, font=self._tk_font(self.mono_font_family, 10),
-                                       bg=CLR_ENTRY_BG, fg=CLR_TEXT, relief="flat", bd=0,
-                                       highlightthickness=0, wrap="word", state="disabled")
-        self.mcp_example_text.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
-
-        # 右：测试日志
-        log_frame = ctk.CTkFrame(bottom, fg_color=CLR_CARD, corner_radius=8)
-        log_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-        log_frame.grid_columnconfigure(0, weight=1)
-        log_frame.grid_rowconfigure(1, weight=1)
-
-        log_hdr = ctk.CTkFrame(log_frame, fg_color="transparent")
-        log_hdr.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
-        ctk.CTkLabel(log_hdr, text="📝 测试日志", font=self._ui_font(12, "bold"),
-                    text_color=CLR_ACCENT).pack(side="left")
-        ctk.CTkButton(log_hdr, text="清空", command=lambda: self._set_text(self.log_text, ""),
-                     width=60, height=24, fg_color=CLR_CARD, hover_color=CLR_HOVER,
-                     border_width=1, border_color=CLR_BORDER,
-                     font=self._ui_font(10)).pack(side="right")
-
-        self.log_text = tk.Text(log_frame, height=7, font=self._tk_font(self.mono_font_family, 10),
-                               bg=CLR_ENTRY_BG, fg=CLR_TEXT, relief="flat", bd=0,
-                               highlightthickness=0, wrap="word")
-        self.log_text.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
-        log_scroll = tk.Scrollbar(log_frame, command=self.log_text.yview,
-                                 bg=CLR_BORDER, activebackground=CLR_HOVER, width=8)
-        log_scroll.grid(row=1, column=1, sticky="ns", pady=(0, 12))
-        self.log_text.config(yscrollcommand=log_scroll.set)
-
-    # ── 数据加载 ──────────────────────────────────────────────────────────────
-    def _load_gateway(self) -> None:
-        gw = self.config.gateway
-        self.port_var.set(str(gw.port))
-        self.gw_key_var.set(gw.access_keys[0] if gw.access_keys else "")
-        self.cooldown_var.set(str(gw.key_cooldown_seconds))
-        self.ttl_var.set(str(gw.session_ttl_seconds))
-        self.retry_var.set(str(gw.max_failover_retries))
-        self.timeout_var.set(str(gw.upstream_timeout_seconds))
-        self.routing_mode_var.set(ROUTING_MODE_LABELS.get(gw.routing_mode, "轮询"))
-
-    def _load_service(self, svc: ServiceConfig) -> None:
-        was_suspended = self._suspend_auto_apply
-        self._suspend_auto_apply = True
-        try:
-            self.svc_name_var.set(svc.name)
-            self.svc_enabled_var.set(svc.enabled)
-            self.svc_url_var.set(svc.upstream_url)
-            self.key_enabled_var.set(svc.key_auth.enabled)
-            self.key_type_var.set(svc.key_auth.type)
-            self.key_param_var.set(svc.key_auth.param)
-            self._set_text(self.patterns_text, "\n".join(svc.failure_patterns))
-            self._refresh_keys_list(svc)
-            self._refresh_mcp_example(svc)
-        finally:
-            self._suspend_auto_apply = was_suspended
-
-    def _refresh_service_list(self, select_index: int | None = None) -> None:
-        self.svc_listbox.delete(0, "end")
-        for svc in self.config.services:
-            prefix = "● " if svc.enabled else "○ "
-            self.svc_listbox.insert("end", f"{prefix}{svc.name}")
-            # 着色
-            idx = self.svc_listbox.size() - 1
-            self.svc_listbox.itemconfig(idx, fg=CLR_SUCCESS if svc.enabled else CLR_MUTED)
-        if self.config.services:
-            if select_index is None or select_index < 0 or select_index >= len(self.config.services):
-                select_index = 0
-            self.current_index = select_index
-            self.svc_listbox.selection_clear(0, "end")
-            self.svc_listbox.selection_set(select_index)
-            self.svc_listbox.activate(select_index)
-            self._load_service(self.config.services[select_index])
-        else:
-            self.current_index = -1
-            self._load_service(ServiceConfig(name="", upstream_url=""))
-
-    def _refresh_keys_list(self, svc: ServiceConfig) -> None:
-        """刷新密钥列表，根据状态着色。"""
-        selected_keys = {
-            svc.keys[index]
-            for index in self.keys_tree.curselection()
-            if 0 <= index < len(svc.keys)
-        }
-        self.keys_tree.delete(0, "end")
-        # 后台异步拉取状态（不阻塞 UI）
-        if not self._stats_cache or (time.time() - self._stats_cache_time > 3.0):
-            threading.Thread(target=self._async_fetch_stats, args=(svc,), daemon=True).start()
-        stats = self._stats_cache.get(svc.name, {}).get("keys", {}).get("details", [])
-        stats_map = {item["key"]: item for item in stats if "key" in item}
-        persisted_map = self.state_store.build_key_map(svc.name, svc.keys)
-        service_stats = self._stats_cache.get(svc.name, {})
-        mode = ROUTING_MODE_LABELS.get(
-            service_stats.get("routing_mode") or ROUTING_LABEL_MODES.get(self.routing_mode_var.get()),
-            "轮询",
-        )
-        primary_tail = service_stats.get("primary_key_tail") or "暂无"
-        self.key_status_label.configure(
-            text=f"{mode} | 当前主 ...{primary_tail}" if mode == "主备" else f"{mode}模式"
-        )
-
-        for key in svc.keys:
-            status_str = "正常"
-            tag_color = CLR_SUCCESS
-            if (svc.name, key) in self._restored_keys:
-                if key in stats_map and not stats_map[key].get("is_disabled") and stats_map[key].get("cooldown_remaining", 0) <= 0:
-                    self._restored_keys.discard((svc.name, key))
-            else:
-                persisted = persisted_map.get(key)
-                if persisted and (
-                    persisted.get("is_disabled") or persisted.get("retest_pending")
-                ):
-                    if persisted.get("retest_pending"):
-                        remaining = persisted.get("disabled_remaining", 0)
-                        if remaining > 0:
-                            status_str = f"冷却中({int(remaining)}s)"
-                        else:
-                            status_str = "等待复测"
-                        tag_color = CLR_WARN
-                    elif persisted.get("disabled_until_epoch", 0) > 0:
-                        status_str = "禁用至下月"
-                        tag_color = CLR_ERROR
-                    else:
-                        status_str = "永久禁用"
-                        tag_color = CLR_ERROR
-                elif key in stats_map:
-                    info = stats_map[key]
-                    if info.get("is_disabled"):
-                        if info.get("retest_pending"):
-                            if info.get("cooldown_remaining", 0) > 0:
-                                status_str = f"冷却中({int(info['cooldown_remaining'])}s)"
-                            else:
-                                status_str = "等待复测"
-                            tag_color = CLR_WARN
-                        else:
-                            status_str = "永久禁用"
-                            tag_color = CLR_ERROR
-                    elif info.get("cooldown_remaining", 0) > 0:
-                        status_str = f"冷却中({int(info['cooldown_remaining'])}s)"
-                        tag_color = CLR_WARN
-            record = persisted_map.get(key)
-            monthly_success_count = (
-                record.get("monthly_success_count", 0) if record else stats_map.get(key, {}).get("monthly_success_count", 0)
+            self._sync_gateway_from_fields()
+            self.manager.write_config_to_disk()
+            self.manager.apply_runtime_sync(
+                self.manager.config.gateway.port,
+                self.manager.config.gateway.access_keys[0]
+                if self.manager.config.gateway.access_keys
+                else "",
             )
-            status_str = f"{status_str} | 本月成功{monthly_success_count}"
-            usage = self._usage_cache.get((svc.name, key))
-            if usage and usage.ok and usage.key_remaining is not None and usage.key_limit is not None:
-                status_str = f"{status_str} | 余{usage.key_remaining}/{usage.key_limit}"
-            # 截断显示：前8位...后8位
-            display = key if len(key) <= 24 else f"{key[:12]}...{key[-8:]}"
-            self.keys_tree.insert("end", f"  {display}  [{status_str}]")
-            idx = self.keys_tree.size() - 1
-            self.keys_tree.itemconfig(idx, fg=tag_color)
-            if key in selected_keys:
-                self.keys_tree.selection_set(idx)
+            self.log("✅ 配置修改已自动保存并热重载")
+        except Exception as exc:
+            self.log(f"⚠️ 自动应用未完成: {exc}")
 
-    def _on_select(self, _event=None) -> None:
-        sel = self.svc_listbox.curselection()
-        if not sel:
-            return
-        idx = int(sel[0])
-        if not self._suspend_auto_apply:
-            self._cancel_auto_apply_timer()
-            self._apply_and_queue_runtime(reason="切换服务前的修改")
-        self._apply_current(silent=True)
-        self.current_index = idx
-        self._load_service(self.config.services[idx])
+    def _sync_gateway_from_fields(self) -> None:
+        """将界面上的输入同步到 Manager 对象。"""
+        port = int(self.port_input.value.strip() or "8080")
+        gw_key = self.access_key_input.value.strip()
+        cooldown = int(self.cooldown_input.value.strip() or "60")
+        retries = int(self.retries_input.value.strip() or "1")
+        timeout = int(self.timeout_input.value.strip() or "120")
+        mode = self.routing_mode_dropdown.value or "轮询"
 
-    # ── 数据提取 ──────────────────────────────────────────────────────────────
-    def _svc_from_fields(self) -> ServiceConfig:
-        """从界面字段提取当前服务配置。"""
-        # 从 Listbox 的 iid 映射回真实密钥
-        # keys_tree 存的是显示文本，真实密钥存在 config.services 中
-        # 只有在用户通过导入/删除操作时才修改 svc.keys，这里直接读取
-        if 0 <= self.current_index < len(self.config.services):
-            keys = self.config.services[self.current_index].keys
-        else:
-            keys = []
-        return ServiceConfig(
-            name=self.svc_name_var.get().strip(),
-            upstream_url=self.svc_url_var.get().strip(),
-            enabled=bool(self.svc_enabled_var.get()),
-            key_auth=KeyAuthConfig(
-                enabled=bool(self.key_enabled_var.get()),
-                type=self.key_type_var.get().strip() or "header",
-                param=self.key_param_var.get().strip(),
-            ),
-            keys=keys,
-            failure_patterns=split_lines(self.patterns_text.get("1.0", "end")),
+        self.manager.update_gateway_config(
+            port=port,
+            access_key=gw_key,
+            cooldown=cooldown,
+            ttl=1800,
+            retries=retries,
+            timeout=timeout,
+            routing_mode=mode,
         )
 
-    def _gw_from_fields(self) -> GatewayConfig:
-        key = self.gw_key_var.get().strip()
-        return GatewayConfig(
-            port=int(self.port_var.get().strip() or "8080"),
-            access_keys=[key] if key else [],
-            key_cooldown_seconds=int(
-                self.cooldown_var.get().strip() or str(DEFAULT_KEY_COOLDOWN_SECONDS)
-            ),
-            session_ttl_seconds=int(self.ttl_var.get().strip() or "1800"),
-            max_failover_retries=int(self.retry_var.get().strip() or "1"),
-            upstream_timeout_seconds=int(self.timeout_var.get().strip() or "120"),
-            routing_mode=ROUTING_LABEL_MODES.get(
-                self.routing_mode_var.get().strip(),
-                ROUTING_MODE_ROUND_ROBIN,
-            ),
+    def handle_add_service(self, e=None) -> None:
+        """打开添加第三方 MCP 服务弹窗。"""
+        name_input = ft.TextField(
+            label="服务唯一标识 (英文标识，如 brave、exa、deepseek)",
+            hint_text="用于访问路由，如 /brave/mcp",
+            dense=True,
+            text_size=12,
+            border_color=CLR_BORDER,
+        )
+        url_input = ft.TextField(
+            label="上游目标 URL (如 https://mcp.brave.com/mcp)",
+            hint_text="必须以 http:// 或 https:// 开头",
+            dense=True,
+            text_size=12,
+            border_color=CLR_BORDER,
+        )
+        auth_type_dd = ft.Dropdown(
+            label="密钥注入位置",
+            dense=True,
+            width=140,
+            value="header",
+            text_size=12,
+            border_color=CLR_BORDER,
+            options=[
+                ft.dropdown.Option("header", "Header (请求头)"),
+                ft.dropdown.Option("query", "Query (URL 参数)"),
+            ],
+        )
+        auth_param_input = ft.TextField(
+            label="参数名 (如 Authorization 或 key)",
+            value="Authorization",
+            dense=True,
+            text_size=12,
+            border_color=CLR_BORDER,
+        )
+        patterns_input = ft.TextField(
+            label="故障判定过滤词 (每行一条，命中则故障转移)",
+            value="rate limit\nquota\nunauthorized\n401\n429",
+            multiline=True,
+            min_lines=3,
+            max_lines=5,
+            text_size=12,
+            text_style=ft.TextStyle(font_family=resolve_mono_font_family()),
+            border_color=CLR_BORDER,
         )
 
-    def _apply_current(self, silent: bool = False) -> bool:
-        if self.current_index < 0:
-            return True
-        try:
-            svc = self._svc_from_fields()
-            svc.validate_basic()
-        except Exception as exc:
-            if not silent:
-                messagebox.showerror(APP_TITLE, f"配置不合法：\n{exc}")
-            return False
-        if 0 <= self.current_index < len(self.config.services):
-            self.config.services[self.current_index] = svc
-        else:
-            self.config.services.append(svc)
-            self.current_index = len(self.config.services) - 1
-        return True
-
-    # ── 操作 ──────────────────────────────────────────────────────────────────
-    def _cancel_auto_apply_timer(self) -> None:
-        """取消尚未执行的自动应用定时器。"""
-        if self._auto_apply_after_id is None:
-            return
-        try:
-            self.root.after_cancel(self._auto_apply_after_id)
-        except tk.TclError:
-            pass
-        self._auto_apply_after_id = None
-
-    def _auto_apply(self) -> None:
-        """执行一次防抖后的自动配置应用。"""
-        self._auto_apply_after_id = None
-        if self._auto_apply_inflight:
-            return
-        self._apply_and_queue_runtime(reason="配置修改", generation=self._auto_apply_generation)
-
-    def _prepare_config(self, *, show_errors: bool) -> bool:
-        """同步并校验界面配置，校验通过后才允许写入文件。"""
-        if not self._apply_current(silent=True):
-            if show_errors:
-                messagebox.showerror(APP_TITLE, "当前服务配置不完整，无法应用")
-            return False
-        try:
-            gateway = self._gw_from_fields()
-            gateway.validate()
-            self.config.gateway = gateway
-            self.config.validate()
-        except Exception as exc:
-            if show_errors:
-                messagebox.showerror(APP_TITLE, f"配置不合法：\n{exc}")
-            self._log(f"❌ 配置未应用：{exc}")
-            return False
-        return True
-
-    def _write_config(self, *, show_errors: bool) -> bool:
-        """将已经校验通过的配置写入 YAML 和本地密钥文件。"""
-        try:
-            dump_config(self.config, str(CONFIG_PATH))
-        except Exception as exc:
-            if show_errors:
-                messagebox.showerror(APP_TITLE, f"配置写入失败：\n{exc}")
-            self._log(f"❌ 配置写入失败：{exc}")
-            return False
-        return True
-
-    def _apply_and_queue_runtime(
-        self,
-        *,
-        reason: str,
-        generation: int | None = None,
-        show_errors: bool = False,
-    ) -> bool:
-        """写入配置并异步通知运行中的网关立即应用。"""
-        if not self._prepare_config(show_errors=show_errors):
-            return False
-        if not self._write_config(show_errors=show_errors):
-            return False
-
-        self._log(f"✅ {reason}已写入配置，正在立即应用…")
-        if generation is None:
-            self._auto_apply_generation += 1
-            generation = self._auto_apply_generation
-        if self._auto_apply_inflight:
-            return True
-        self._auto_apply_inflight = True
-        target_port = self.config.gateway.port
-        target_key = self.config.gateway.access_keys[0]
-        old_port = self._runtime_port
-        old_key = self._runtime_access_key
-        threading.Thread(
-            target=self._apply_runtime_worker,
-            args=(generation, old_port, old_key, target_port, target_key),
-            daemon=True,
-        ).start()
-        return True
-
-    def _apply_runtime_worker(
-        self,
-        generation: int,
-        old_port: int,
-        old_key: str,
-        target_port: int,
-        target_key: str,
-    ) -> None:
-        """在后台热加载配置，必要时重启网关进程。"""
-        try:
-            old_healthy = self._gateway_is_healthy(old_port)
-            target_healthy = self._gateway_is_healthy(target_port)
-
-            if old_healthy and target_port == old_port:
-                ok, error = self._request_gateway_reload(old_port, old_key)
-                if not ok:
-                    raise RuntimeError(error or "网关拒绝热加载配置")
-            elif old_healthy and target_port != old_port:
-                self._stop_running_gateway(old_port, old_key)
-                self._start_and_wait_gateway(target_port)
-            elif target_healthy:
-                ok, error = self._request_gateway_reload(target_port, old_key)
-                if not ok:
-                    raise RuntimeError(error or "目标端口上的网关拒绝热加载配置")
-            else:
-                self._stop_owned_server_process()
-                self._start_and_wait_gateway(target_port)
-
-            self.root.after(0, lambda: self._finish_auto_apply(
-                generation, target_port, target_key, None,
-            ))
-        except Exception as exc:
-            message = str(exc)
-            self.root.after(0, lambda: self._finish_auto_apply(
-                generation, target_port, target_key, message,
-            ))
-
-    def _finish_auto_apply(
-        self,
-        generation: int,
-        target_port: int,
-        target_key: str,
-        error: str | None,
-    ) -> None:
-        """在主线程收尾自动应用，并处理应用期间产生的新修改。"""
-        self._auto_apply_inflight = False
-        if error is None:
-            self._runtime_port = target_port
-            self._runtime_access_key = target_key
-            self._stats_cache_time = 0.0
-            self._log("✅ 配置已立即生效")
-        else:
-            self._log(f"❌ 配置立即应用失败：{error}")
-
-        if generation != self._auto_apply_generation:
-            self._auto_apply_after_id = self.root.after(100, self._auto_apply)
-
-    def _restart_service(self) -> None:
-        """立即写入当前配置并重启本地网关。"""
-        if self._auto_apply_inflight:
-            self._log("⚠️ 当前已有配置正在应用，请稍候再重启")
-            return
-        self._cancel_auto_apply_timer()
-        self._auto_apply_generation += 1
-        if not self._prepare_config(show_errors=True):
-            return
-        if not self._write_config(show_errors=True):
-            return
-
-        self.restart_button.configure(state="disabled")
-        self._log("🔄 正在重启本地网关，请稍候…")
-        self._auto_apply_inflight = True
-        target_port = self.config.gateway.port
-        target_key = self.config.gateway.access_keys[0]
-        generation = self._auto_apply_generation
-        threading.Thread(
-            target=self._restart_service_worker,
-            args=(generation, self._runtime_port, self._runtime_access_key, target_port, target_key),
-            daemon=True,
-        ).start()
-
-    def _restart_service_worker(
-        self,
-        generation: int,
-        old_port: int,
-        old_key: str,
-        target_port: int,
-        target_key: str,
-    ) -> None:
-        """在后台完成网关退出、启动和健康检查。"""
-        try:
-            if self._gateway_is_healthy(old_port):
-                self._stop_running_gateway(old_port, old_key)
-            else:
-                self._stop_owned_server_process()
-            self._start_and_wait_gateway(target_port)
-            self.root.after(0, lambda: self._finish_manual_restart(
-                generation, target_port, target_key, None,
-            ))
-        except Exception as exc:
-            message = str(exc)
-            self.root.after(0, lambda: self._finish_manual_restart(
-                generation, target_port, target_key, message,
-            ))
-
-    def _finish_manual_restart(
-        self,
-        generation: int,
-        target_port: int,
-        target_key: str,
-        error: str | None,
-    ) -> None:
-        """在主线程完成手动重启状态更新。"""
-        self._auto_apply_inflight = False
-        self.restart_button.configure(state="normal")
-        if error is None:
-            self._runtime_port = target_port
-            self._runtime_access_key = target_key
-            self._stats_cache_time = 0.0
-            self._log("✅ 网关已重启，配置已生效")
-        else:
-            self._log(f"❌ 重启服务失败：{error}")
-            messagebox.showerror(APP_TITLE, f"重启服务失败：\n{error}")
-        if generation != self._auto_apply_generation:
-            self._auto_apply_after_id = self.root.after(100, self._auto_apply)
-
-    def _stop_running_gateway(self, port: int, access_key: str) -> None:
-        """请求运行中的新版本网关优雅退出，并等待端口释放。"""
-        requested, error = self._request_gateway_restart(port, access_key)
-        if error:
-            raise RuntimeError(error)
-        if requested:
-            if not self._wait_for_gateway_down(port, timeout=6.0):
-                raise RuntimeError("旧网关未能在 6 秒内退出")
-            return
-        if self._gateway_is_healthy(port):
-            raise RuntimeError("网关健康检查通过，但无法请求其优雅退出")
-        self._stop_owned_server_process()
-
-    def _start_and_wait_gateway(self, port: int) -> None:
-        """启动网关并等待健康检查通过。"""
-        process = self._start_gateway_process()
-        self._server_process = process
-        if self._wait_for_gateway_up(port, process, timeout=12.0):
-            return
-        exit_code = process.poll()
-        if exit_code is None:
-            process.terminate()
-            try:
-                process.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=2.0)
-        self._server_process = None
-        detail = f"进程已退出（退出码 {exit_code}）" if exit_code is not None else "健康检查超时"
-        raise RuntimeError(f"新网关启动失败：{detail}")
-
-    def _request_gateway_reload(
-        self,
-        port: int,
-        access_key: str,
-    ) -> tuple[bool, str | None]:
-        """请求运行中的网关重新读取配置。"""
-        import httpx
-
-        if not access_key:
-            return False, "未设置网关访问密钥，无法热加载配置"
-        try:
-            with httpx.Client(timeout=2.0) as client:
-                response = client.post(
-                    f"http://127.0.0.1:{port}/admin/reload",
-                    headers={"Authorization": f"Bearer {access_key}"},
-                )
-        except httpx.RequestError as exc:
-            return False, f"无法连接网关：{exc}"
-
-        if response.status_code == 200:
-            return True, None
-        if response.status_code == 401:
-            return False, "网关访问密钥不正确，无法热加载配置"
-        try:
-            detail = response.json().get("message", response.text)
-        except ValueError:
-            detail = response.text
-        return False, f"网关拒绝热加载：HTTP {response.status_code} {detail}".strip()
-
-    def _request_gateway_restart(
-        self,
-        port: int,
-        access_key: str,
-    ) -> tuple[bool, str | None]:
-        """请求正在运行的网关退出；未运行时返回 False 且不报错。"""
-        import httpx
-
-        try:
-            with httpx.Client(timeout=2.0) as client:
-                response = client.post(
-                    f"http://127.0.0.1:{port}/admin/restart",
-                    headers={"Authorization": f"Bearer {access_key}"},
-                )
-        except httpx.RequestError:
-            return False, None
-
-        if response.status_code == 200:
-            return True, None
-        if response.status_code == 404:
-            return False, "当前网关不支持优雅重启接口，请先启动最新网关程序"
-        if response.status_code == 401:
-            return False, "网关访问密钥不正确，无法重启服务"
-        try:
-            detail = response.json().get("message", response.text)
-        except ValueError:
-            detail = response.text
-        return False, f"网关拒绝重启请求：HTTP {response.status_code} {detail}".strip()
-
-    def _start_gateway_process(self) -> subprocess.Popen:
-        """启动新的网关进程并返回进程句柄。"""
-        if not START_SCRIPT.exists():
-            raise FileNotFoundError(f"启动脚本不存在：{START_SCRIPT}")
-
-        gateway_python = self._resolve_gateway_python()
-
-        kwargs = {
-            "cwd": str(PROJECT_ROOT),
-            "stdin": subprocess.DEVNULL,
-        }
-        if sys.platform == "win32":
-            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        return subprocess.Popen(
-            [str(gateway_python), str(START_SCRIPT), "--config", str(CONFIG_PATH)],
-            **kwargs,
-        )
-
-    def _resolve_gateway_python(self) -> Path:
-        """选择能够导入网关运行依赖的 Python 解释器。"""
-        probe = "import httpx, starlette, uvicorn, yaml"
-        failures: list[str] = []
-        for candidate in _gateway_python_candidates():
-            if not candidate.is_file():
-                failures.append(f"{candidate}：文件不存在")
-                continue
-            try:
-                result = subprocess.run(
-                    [str(candidate), "-c", probe],
-                    cwd=str(PROJECT_ROOT),
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    timeout=5.0,
-                    check=False,
-                )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                failures.append(f"{candidate}：{exc}")
-                continue
-            if result.returncode == 0:
-                return candidate
-            detail = (result.stderr or result.stdout).strip().splitlines()
-            failures.append(f"{candidate}：{detail[-1] if detail else '网关依赖检查失败'}")
-
-        requirements_path = PROJECT_ROOT / "requirements.txt"
-        details = "\n".join(f"- {failure}" for failure in failures)
-        raise RuntimeError(
-            "没有可用的网关 Python 解释器：\n"
-            f"{details}\n"
-            "请先安装项目依赖：\n"
-            f"{_gateway_python_candidates()[0]} -m pip install -r {requirements_path}"
-        )
-
-    def _stop_owned_server_process(self) -> None:
-        """仅停止由当前 GUI 启动且仍存活的网关进程。"""
-        process = self._server_process
-        if process is None or process.poll() is not None:
-            return
-        process.terminate()
-        try:
-            process.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=2.0)
-        self._server_process = None
-
-    def _gateway_is_healthy(self, port: int) -> bool:
-        """检查本机网关健康状态。"""
-        import httpx
-
-        try:
-            with httpx.Client(timeout=0.8) as client:
-                return client.get(f"http://127.0.0.1:{port}/healthz").status_code == 200
-        except httpx.RequestError:
-            return False
-
-    def _wait_for_gateway_down(self, port: int, timeout: float) -> bool:
-        """等待旧网关释放端口。"""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if not self._gateway_is_healthy(port):
-                return True
-            time.sleep(0.15)
-        return False
-
-    def _wait_for_gateway_up(self, port: int, process: subprocess.Popen, timeout: float) -> bool:
-        """等待新网关通过健康检查。"""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                return False
-            if self._gateway_is_healthy(port):
-                return True
-            time.sleep(0.2)
-        return False
-
-    def _import_keys(self) -> None:
-        """弹窗批量导入密钥。"""
-        if self.current_index < 0:
-            messagebox.showwarning(APP_TITLE, "请先选择一个服务")
-            return
-        dialog = ctk.CTkToplevel(self.root)
-        dialog.title("批量导入密钥")
-        dialog.geometry("700x500")
-        dialog.minsize(500, 300)
-        self._set_modal(dialog)
-        dialog.configure(fg_color=CLR_BG)
-        dialog.grid_columnconfigure(0, weight=1)
-        dialog.grid_rowconfigure(1, weight=1)
-
-        # 标题
-        ctk.CTkLabel(dialog, text="请输入密钥列表（每行一个，自动去重）:",
-                    font=self._ui_font(12, "bold"),
-                    text_color=CLR_TEXT).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 8))
-
-        # 文本框
-        text_area = tk.Text(dialog, font=self._tk_font(self.mono_font_family, 11), bg=CLR_ENTRY_BG, fg=CLR_TEXT,
-                           relief="flat", bd=0, highlightthickness=0, wrap="none",
-                           insertbackground=CLR_TEXT)
-        text_area.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
-        text_area.focus_set()
-
-        def do_import():
-            raw_text = text_area.get("1.0", "end")
-            imported_keys = split_lines(raw_text)
-            if not imported_keys:
-                dialog.destroy()
+        def do_confirm(ev):
+            name_val = name_input.value.strip()
+            url_val = url_input.value.strip()
+            if not name_val:
+                self.show_snack("服务标识不能为空", CLR_WARN)
                 return
-            svc = self.config.services[self.current_index]
-            old_count = len(svc.keys)
-            svc.keys = dedupe_keep_order(svc.keys + imported_keys)
-            new_added = len(svc.keys) - old_count
-            self._refresh_keys_list(svc)
-            applied = True
-            if new_added:
-                applied = self._apply_and_queue_runtime(reason="导入密钥")
-            self._log(f"✅ 批量导入完成：新增 {new_added} 个密钥（已去重）")
-            dialog.destroy()
-            if applied:
-                messagebox.showinfo(APP_TITLE, f"成功导入 {new_added} 个新密钥！")
-            else:
-                messagebox.showwarning(APP_TITLE, "密钥已加入当前编辑区，但配置尚未应用，请先修正无效设置")
+            if not url_val:
+                self.show_snack("上游目标 URL 不能为空", CLR_WARN)
+                return
 
-        # 按钮
-        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-        btn_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 16))
-        ctk.CTkButton(btn_row, text="取消", command=dialog.destroy, width=80,
-                     fg_color=CLR_CARD, hover_color=CLR_HOVER, border_width=1, border_color=CLR_BORDER,
-                     font=self._ui_font(11)).pack(side="right", padx=(4, 0))
-        ctk.CTkButton(btn_row, text="导入", command=do_import, width=80,
-                     fg_color=CLR_ACCENT, hover_color=CLR_HOVER,
-                     font=self._ui_font(11)).pack(side="right", padx=(0, 4))
-
-    def _show_raw_errors(self) -> None:
-        """显示选中密钥最近一次失败的原始响应。"""
-        if self.current_index < 0:
-            return
-        selections = self.keys_tree.curselection()
-        if not selections:
-            messagebox.showwarning(APP_TITLE, "请先选择要查看的密钥")
-            return
-
-        svc = self.config.services[self.current_index]
-        records = self.state_store.build_key_map(svc.name, svc.keys)
-        stats = self._stats_cache.get(svc.name, {}).get("keys", {}).get("details", [])
-        stats_map = {item["key"]: item for item in stats if "key" in item}
-        reports: list[str] = []
-        for index in selections:
-            if not (0 <= index < len(svc.keys)):
-                continue
-            key = svc.keys[index]
-            record = records.get(key, {})
-            info = stats_map.get(key, {})
-            raw_error = record.get("raw_error") or info.get("raw_error") or "暂无原始错误记录"
-            status_code = record.get("raw_status_code") or info.get("raw_status_code")
-            status_text = f"HTTP {status_code}" if status_code else "无 HTTP 状态码"
-            reports.append(f"密钥 ...{key[-6:]} | {status_text}\n{raw_error}")
-
-        dialog = ctk.CTkToplevel(self.root)
-        dialog.title("原始错误详情")
-        dialog.geometry("900x560")
-        dialog.minsize(600, 360)
-        dialog.configure(fg_color=CLR_BG)
-        self._set_modal(dialog)
-        dialog.grid_columnconfigure(0, weight=1)
-        dialog.grid_rowconfigure(0, weight=1)
-
-        text_widget = tk.Text(
-            dialog,
-            font=self._tk_font(self.mono_font_family, 10),
-            bg=CLR_ENTRY_BG,
-            fg=CLR_TEXT,
-            insertbackground=CLR_TEXT,
-            relief="flat",
-            bd=0,
-            highlightthickness=0,
-            wrap="word",
-        )
-        text_widget.grid(row=0, column=0, sticky="nsew", padx=16, pady=(16, 8))
-        text_widget.insert("1.0", "\n\n".join(reports))
-        text_widget.configure(state="disabled")
-        ctk.CTkButton(
-            dialog,
-            text="确定",
-            command=dialog.destroy,
-            fg_color=CLR_ACCENT,
-            hover_color=CLR_HOVER,
-            font=self._ui_font(11),
-        ).grid(row=1, column=0, sticky="e", padx=16, pady=(0, 16))
-
-    def _delete_selected_keys(self) -> None:
-        """删除选中的密钥。"""
-        if self.current_index < 0:
-            return
-        selections = self.keys_tree.curselection()
-        if not selections:
-            messagebox.showwarning(APP_TITLE, "请先选择要删除的密钥")
-            return
-        svc = self.config.services[self.current_index]
-        if not messagebox.askyesno(APP_TITLE, f"确定删除选中的 {len(selections)} 个密钥吗？"):
-            return
-        # 按倒序删除（避免索引偏移）
-        for idx in sorted(selections, reverse=True):
-            if 0 <= idx < len(svc.keys):
-                self.state_store.reset_key(svc.name, svc.keys[idx])
-                self._usage_cache.pop((svc.name, svc.keys[idx]), None)
-                self._restored_keys.discard((svc.name, svc.keys[idx]))
-                del svc.keys[idx]
-        self._refresh_keys_list(svc)
-        applied = self._apply_and_queue_runtime(reason="删除选中密钥")
-        self._log(f"✅ 已删除 {len(selections)} 个密钥")
-        if applied:
-            messagebox.showinfo(APP_TITLE, f"已删除 {len(selections)} 个密钥")
-        else:
-            messagebox.showwarning(APP_TITLE, "密钥已从当前编辑区删除，但配置尚未应用，请先修正无效设置")
-
-    def _delete_all_keys(self) -> None:
-        """删除当前服务的全部上游密钥，并立即应用配置。"""
-        if self.current_index < 0:
-            return
-        svc = self.config.services[self.current_index]
-        if not svc.keys:
-            messagebox.showinfo(APP_TITLE, "当前服务没有可删除的密钥")
-            return
-        if not messagebox.askyesno(
-            APP_TITLE,
-            f"确定删除当前服务的全部 {len(svc.keys)} 把密钥吗？\n此操作会立即生效。",
-        ):
-            return
-
-        for key in svc.keys:
-            self.state_store.reset_key(svc.name, key)
-            self._usage_cache.pop((svc.name, key), None)
-            self._restored_keys.discard((svc.name, key))
-        deleted = len(svc.keys)
-        svc.keys = []
-        self._stats_cache_time = 0.0
-        self._refresh_keys_list(svc)
-        applied = self._apply_and_queue_runtime(reason="删除全部密钥")
-        self._log(f"✅ 已删除当前服务全部 {deleted} 个密钥")
-        if applied:
-            messagebox.showinfo(APP_TITLE, f"已删除全部 {deleted} 个密钥")
-        else:
-            messagebox.showwarning(APP_TITLE, "密钥已从当前编辑区删除，但配置尚未应用，请先修正无效设置")
-
-    def _reset_selected_key_states(self) -> None:
-        """清除选中密钥的本地废弃状态。"""
-        if self.current_index < 0:
-            return
-        selections = self.keys_tree.curselection()
-        if not selections:
-            messagebox.showwarning(APP_TITLE, "请先选择要恢复状态的密钥")
-            return
-        svc = self.config.services[self.current_index]
-        restored = 0
-        for idx in selections:
-            if 0 <= idx < len(svc.keys):
-                self._restore_key_available(svc, svc.keys[idx])
-                restored += 1
-        self._refresh_keys_list(svc)
-        self._log(f"✅ 已恢复 {restored} 个密钥为可用状态")
-        messagebox.showinfo(APP_TITLE, f"已恢复 {restored} 个密钥为可用状态")
-
-    def _reset_all_disabled_keys(self) -> None:
-        """恢复当前服务所有失效（禁用/冷却中）密钥为可用状态。"""
-        if self.current_index < 0:
-            return
-        svc = self.config.services[self.current_index]
-        stats = self._stats_cache.get(svc.name, {}).get("keys", {}).get("details", [])
-        stats_map = {item["key"]: item for item in stats if "key" in item}
-        persisted_map = self.state_store.build_key_map(svc.name, svc.keys)
-
-        disabled_keys: list[str] = []
-        for key in svc.keys:
-            is_disabled = False
-            persisted = persisted_map.get(key)
-            if persisted and (
-                persisted.get("is_disabled")
-                or persisted.get("retest_pending")
-                or persisted.get("retest_due")
-            ):
-                is_disabled = True
-            elif key in stats_map:
-                info = stats_map[key]
-                if info.get("is_disabled") or info.get("cooldown_remaining", 0) > 0:
-                    is_disabled = True
-            if is_disabled:
-                disabled_keys.append(key)
-
-        if not disabled_keys:
-            messagebox.showinfo(APP_TITLE, "当前服务没有失效密钥")
-            return
-
-        if not messagebox.askyesno(
-            APP_TITLE,
-            f"确定恢复全部 {len(disabled_keys)} 把失效密钥为可用状态吗？\n"
-            "（这会清除所有密钥的冷却和禁用状态）",
-        ):
-            return
-
-        for key in disabled_keys:
-            self._restore_key_available(svc, key)
-        self._refresh_keys_list(svc)
-        self._log(f"✅ 已恢复全部 {len(disabled_keys)} 把失效密钥为可用状态")
-        messagebox.showinfo(APP_TITLE, f"已恢复 {len(disabled_keys)} 把失效密钥为可用状态")
-
-    def _test_selected_keys(self) -> None:
-        """测试选中的密钥。"""
-        if not self._apply_current(silent=True):
-            return
-        if self.current_index < 0:
-            messagebox.showwarning(APP_TITLE, "没有可测试的服务")
-            return
-        svc = self.config.services[self.current_index]
-        selections = self.keys_tree.curselection()
-        if not selections:
-            messagebox.showwarning(APP_TITLE, "请先选择要测试的密钥")
-            return
-        # 提取选中的密钥
-        selected_keys = [svc.keys[idx] for idx in selections if 0 <= idx < len(svc.keys)]
-        if not selected_keys:
-            messagebox.showwarning(APP_TITLE, "无有效的密钥可测试")
-            return
-        self._run_test(svc, selected_keys)
-
-    def _query_selected_usage(self) -> None:
-        """查询选中密钥的额度。"""
-        if not self._apply_current(silent=True):
-            return
-        if self.current_index < 0:
-            messagebox.showwarning(APP_TITLE, "没有可查询的服务")
-            return
-        svc = self.config.services[self.current_index]
-        provider = get_provider(svc.name)
-        if provider is None or not provider.supports_usage:
-            messagebox.showwarning(APP_TITLE, f"[{svc.name}] 当前不支持精确额度查询")
-            return
-        selections = self.keys_tree.curselection()
-        if not selections:
-            messagebox.showwarning(APP_TITLE, "请先选择要查询额度的密钥")
-            return
-        selected_keys = [svc.keys[idx] for idx in selections if 0 <= idx < len(svc.keys)]
-        if not selected_keys:
-            messagebox.showwarning(APP_TITLE, "无有效的密钥可查询额度")
-            return
-        self._run_usage_query(svc, provider, selected_keys)
-
-    def _test_all_keys(self) -> None:
-        """测试全部密钥。"""
-        if not self._apply_current(silent=True):
-            return
-        if self.current_index < 0:
-            messagebox.showwarning(APP_TITLE, "没有可测试的服务")
-            return
-        svc = self.config.services[self.current_index]
-        if not svc.keys:
-            messagebox.showwarning(APP_TITLE, f"[{svc.name}] 没有密钥可测试")
-            return
-        self._run_test(svc, svc.keys)
-
-    def _run_test(self, svc: ServiceConfig, keys: list[str]) -> None:
-        """执行密钥测试（后台线程）。"""
-        self._log(f"🔄 开始并发测试 [{svc.name}] 的 {len(keys)} 把密钥…")
-        
-        # 进度弹窗
-        progress_dialog = ctk.CTkToplevel(self.root)
-        progress_dialog.title("测试中")
-        progress_dialog.geometry("400x120")
-        progress_dialog.resizable(False, False)
-        progress_dialog.configure(fg_color=CLR_BG)
-        self._set_modal(progress_dialog)
-
-        ctk.CTkLabel(progress_dialog, text=f"正在测试 {len(keys)} 把密钥...",
-                    font=self._ui_font(12, "bold"),
-                    text_color=CLR_TEXT).pack(expand=True, padx=20, pady=20)
-
-        def worker() -> None:
             try:
-                concurrency = min(len(keys), 5)
-                results = asyncio.run(validate_keys(svc, keys, deep=True, concurrency=concurrency, timeout=45.0))
-                self.root.after(0, lambda: [progress_dialog.destroy(), self._show_results(svc, results)])
-            except Exception as exc:
-                self.root.after(0, lambda: [progress_dialog.destroy(), self._log(f"❌ 测试异常：{exc}")])
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _run_usage_query(self, svc: ServiceConfig, provider, keys: list[str]) -> None:
-        """后台查询密钥额度。"""
-        self._log(f"🔄 开始查询 [{svc.name}] 的 {len(keys)} 把密钥额度…")
-
-        progress_dialog = ctk.CTkToplevel(self.root)
-        progress_dialog.title("额度查询中")
-        progress_dialog.geometry("420x120")
-        progress_dialog.resizable(False, False)
-        progress_dialog.configure(fg_color=CLR_BG)
-        self._set_modal(progress_dialog)
-
-        ctk.CTkLabel(progress_dialog, text=f"正在查询 {len(keys)} 把密钥额度...",
-                    font=self._ui_font(12, "bold"),
-                    text_color=CLR_TEXT).pack(expand=True, padx=20, pady=20)
-
-        def worker() -> None:
-            try:
-                results = asyncio.run(self._fetch_usage_snapshots(provider, keys))
-                self.root.after(
-                    0,
-                    lambda: [progress_dialog.destroy(), self._show_usage_results(svc, results)],
+                patterns = split_lines(patterns_input.value or "")
+                self.manager.add_service(
+                    name=name_val,
+                    upstream_url=url_val,
+                    key_auth_type=auth_type_dd.value or "header",
+                    key_param=auth_param_input.value.strip() or "Authorization",
+                    failure_patterns=patterns,
                 )
+                self.page.close(dlg)
+                self.manager.write_config_to_disk()
+                new_index = len(self.manager.config.services) - 1
+                self.load_service(new_index)
+                self.refresh_service_list()
+                self.page.update()
+                self.log(f"➕ 成功添加第三方 MCP 服务: [{name_val}] -> {url_val}")
+                self.show_snack(f"成功添加服务 [{name_val}]！", CLR_SUCCESS)
             except Exception as exc:
-                self.root.after(0, lambda: [progress_dialog.destroy(), self._log(f"❌ 额度查询异常：{exc}")])
+                self.show_snack(f"添加服务失败: {exc}", CLR_ERROR)
 
-        threading.Thread(target=worker, daemon=True).start()
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("➕ 添加第三方 MCP 服务"),
+            content=ft.Container(
+                content=ft.Column(
+                    controls=[
+                        name_input,
+                        url_input,
+                        ft.Row(controls=[auth_type_dd, ft.Container(content=auth_param_input, expand=True)], spacing=10),
+                        patterns_input,
+                    ],
+                    spacing=10,
+                ),
+                width=540,
+            ),
+            actions=[
+                ft.TextButton("取消", on_click=lambda ev: self.page.close(dlg)),
+                ft.FilledButton("确认添加", on_click=do_confirm),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.open(dlg)
 
-    def _show_results(self, svc: ServiceConfig, results) -> None:
-        """展示手动测试结果，并同步更新密钥状态。"""
-        name = svc.name
-        valid_list, failed_list = [], []
-        disabled_count = 0
+    def handle_delete_service(self, e=None) -> None:
+        """删除当前选中的服务。"""
+        if not (0 <= self.current_service_index < len(self.manager.config.services)):
+            self.show_snack("当前没有可删除的服务", CLR_WARN)
+            return
+
+        svc = self.manager.config.services[self.current_service_index]
+        svc_name = svc.name
+
+        def do_delete(ev):
+            self.page.close(dlg)
+            self.manager.delete_service(self.current_service_index)
+            self.manager.write_config_to_disk()
+            self.current_service_index = 0 if self.manager.config.services else -1
+            if self.current_service_index >= 0:
+                self.load_service(self.current_service_index)
+            else:
+                self.keys_listview.controls.clear()
+                self.services_listview.controls.clear()
+                self.page.update()
+            self.refresh_service_list()
+            self.log(f"🗑️ 已删除服务: [{svc_name}]")
+            self.show_snack(f"服务 [{svc_name}] 已删除", CLR_SUCCESS)
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("确认删除该服务？"),
+            content=ft.Text(f"即将删除服务 [{svc_name}] 及其全部 {len(svc.keys)} 把密钥。\n此操作不可撤销。"),
+            actions=[
+                ft.TextButton("取消", on_click=lambda ev: self.page.close(dlg)),
+                ft.FilledButton("确认删除", style=ft.ButtonStyle(bgcolor=CLR_ERROR), on_click=do_delete),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.open(dlg)
+
+    def handle_save_config(self, e=None) -> None:
+        """手动点击立即应用配置。"""
+        try:
+            self._sync_gateway_from_fields()
+            self.manager.write_config_to_disk()
+            self.manager.apply_runtime_sync(
+                self.manager.config.gateway.port,
+                self.manager.config.gateway.access_keys[0]
+                if self.manager.config.gateway.access_keys
+                else "",
+            )
+            self.show_snack("✅ 配置已立即保存并应用成功！", CLR_SUCCESS)
+            self.log("✅ 手动应用配置完成")
+        except Exception as exc:
+            self.show_snack(f"❌ 配置应用失败: {exc}", CLR_ERROR)
+            self.log(f"❌ 配置应用失败: {exc}")
+
+    def handle_restart_gateway(self, e=None) -> None:
+        """重启本地网关服务。"""
+        self.show_snack("🔄 正在重启本地网关服务，请稍候...", CLR_WARN)
+        self.log("🔄 开始重启网关服务...")
+
+        def _worker():
+            try:
+                self._sync_gateway_from_fields()
+                self.manager.write_config_to_disk()
+                target_port = self.manager.config.gateway.port
+                target_key = (
+                    self.manager.config.gateway.access_keys[0]
+                    if self.manager.config.gateway.access_keys
+                    else ""
+                )
+                self.manager.stop_running_gateway(self.manager.runtime_port, self.manager.runtime_access_key)
+                self.manager.start_and_wait_gateway(target_port)
+                self.manager.runtime_port = target_port
+                self.manager.runtime_access_key = target_key
+                self.log("✅ 网关服务已成功重启并恢复健康")
+                self.show_snack("✅ 网关服务已成功重启并正常运行！", CLR_SUCCESS)
+            except Exception as exc:
+                self.log(f"❌ 网关重启失败: {exc}")
+                self.show_snack(f"❌ 网关重启失败: {exc}", CLR_ERROR)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ── 密钥操作动作 ──────────────────────────────────────────────────────────
+    def toggle_key_selection(self, key: str, selected: bool) -> None:
+        if selected:
+            self.selected_keys.add(key)
+        else:
+            self.selected_keys.discard(key)
+        self.refresh_keys_list()
+        self.page.update()
+
+    def handle_select_all_toggle(self, e=None) -> None:
+        if not (0 <= self.current_service_index < len(self.manager.config.services)):
+            return
+        svc = self.manager.config.services[self.current_service_index]
+        if self.select_all_cb.value:
+            self.selected_keys = set(svc.keys)
+        else:
+            self.selected_keys.clear()
+        self.refresh_keys_list()
+        self.page.update()
+
+    def handle_search_change(self, e=None) -> None:
+        self.search_filter = self.search_input.value.strip()
+        self.refresh_keys_list()
+        self.page.update()
+
+    def handle_filter_change(self, e=None) -> None:
+        self.status_filter = self.filter_dropdown.value
+        self.refresh_keys_list()
+        self.page.update()
+
+    def handle_import_keys(self, e=None) -> None:
+        """打开批量导入密钥弹窗。"""
+        if not (0 <= self.current_service_index < len(self.manager.config.services)):
+            self.show_snack("请先选择一个有效服务", CLR_WARN)
+            return
+
+        text_input = ft.TextField(
+            label="请输入密钥列表",
+            hint_text="每行一把密钥，自动去重...",
+            multiline=True,
+            min_lines=8,
+            max_lines=12,
+            text_size=12,
+            border_color=CLR_BORDER,
+        )
+
+        def do_confirm(ev):
+            raw = text_input.value or ""
+            new_count, all_keys = self.manager.import_keys(self.current_service_index, raw)
+            self.page.close(dlg)
+            self.manager.write_config_to_disk()
+            self.refresh_keys_list()
+            self.refresh_service_list()
+            self.page.update()
+            self.log(f"📥 批量导入完成: 新增 {new_count} 把密钥 (当前总数: {len(all_keys)})")
+            self.show_snack(f"成功导入 {new_count} 把新密钥！", CLR_SUCCESS)
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("📥 批量导入密钥"),
+            content=ft.Container(content=text_input, width=540),
+            actions=[
+                ft.TextButton("取消", on_click=lambda ev: self.page.close(dlg)),
+                ft.FilledButton("导入", on_click=do_confirm),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.open(dlg)
+
+    def handle_test_selected(self, e=None) -> None:
+        """测试勾选的密钥。"""
+        if not self.selected_keys:
+            self.show_snack("请先勾选需要测试的密钥", CLR_WARN)
+            return
+        keys = list(self.selected_keys)
+        self._run_keys_validation(keys)
+
+    def handle_test_all(self, e=None) -> None:
+        """测试当前服务的全部密钥。"""
+        if not (0 <= self.current_service_index < len(self.manager.config.services)):
+            return
+        keys = list(self.manager.config.services[self.current_service_index].keys)
+        if not keys:
+            self.show_snack("当前服务没有可测试的密钥", CLR_WARN)
+            return
+        self._run_keys_validation(keys)
+
+    def handle_single_key_test(self, key: str) -> None:
+        self._run_keys_validation([key])
+
+    def _run_keys_validation(self, keys: list[str]) -> None:
+        """执行后台并发测试并弹窗汇报。"""
+        svc = self.manager.config.services[self.current_service_index]
+        self.log(f"🧪 开始并发测试 [{svc.name}] 的 {len(keys)} 把密钥...")
+        self.show_snack(f"开始测试 {len(keys)} 把密钥，请稍候...", CLR_ACCENT)
+
+        def _worker():
+            try:
+                results = asyncio.run(
+                    self.manager.run_key_validation(
+                        self.current_service_index, keys, concurrency=5, timeout=45.0
+                    )
+                )
+                self.manager.write_config_to_disk()
+                self._show_validation_results_dialog(svc.name, results)
+            except Exception as exc:
+                self.log(f"❌ 测试过程异常: {exc}")
+                self.show_snack(f"测试失败: {exc}", CLR_ERROR)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _show_validation_results_dialog(self, svc_name: str, results: list[ValidationResult]) -> None:
+        """展示测试结果弹窗。"""
+        valid_count = sum(1 for r in results if r.status == "valid")
+        failed_count = len(results) - valid_count
+
+        result_items: list[ft.Control] = []
         for r in results:
-            icon = {"valid": "✅", "quota_exhausted": "⚠️", "invalid": "❌"}.get(r.status, "💥")
-            line = f"  {icon} {r.key} | {r.latency_ms}ms | {r.detail}"
-            if r.status == "valid":
-                self._restore_key_available(svc, r.key)
-            else:
-                self._disable_key_after_manual_test(svc, r)
-                disabled_count += 1
-            (valid_list if r.status == "valid" else failed_list).append(line)
+            icon = ft.Icons.CHECK_CIRCLE_ROUNDED if r.status == "valid" else ft.Icons.CANCEL_ROUNDED
+            color = CLR_SUCCESS if r.status == "valid" else CLR_ERROR
+            tail = r.key[-8:] if len(r.key) >= 8 else r.key
 
-        ok, failed = len(valid_list), len(failed_list)
-        self._log(f"[{name}] 测试完成：✅ {ok} 把有效，❌ {failed} 把失败")
-        for line in valid_list + failed_list:
-            self._log(line)
-        if disabled_count:
-            self._log(f"⚠️ 已自动禁用 {disabled_count} 把测试失败的密钥，可手动恢复")
-        self._log("─" * 60)
-        if 0 <= self.current_index < len(self.config.services) and self.config.services[self.current_index] is svc:
-            self._refresh_keys_list(svc)
-
-        # 结果弹窗
-        result_dialog = ctk.CTkToplevel(self.root)
-        result_dialog.title("测试结果")
-        result_dialog.geometry("800x480")
-        result_dialog.configure(fg_color=CLR_BG)
-        self._set_modal(result_dialog)
-        result_dialog.grid_columnconfigure(0, weight=1)
-        result_dialog.grid_rowconfigure(1, weight=1)
-
-        ctk.CTkLabel(result_dialog, text=f"[{name}] 测试完成：✅ {ok} 把有效  ❌ {failed} 把失败",
-                    font=self._ui_font(13, "bold"),
-                    text_color=CLR_TEXT).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 8))
-
-        report = "\n".join([f"✅ 有效密钥 ({ok} 把):"] + valid_list +
-                           ["", f"❌ 失败密钥 ({failed} 把):"] + failed_list)
-        text_widget = tk.Text(result_dialog, font=self._tk_font(self.mono_font_family, 10), bg=CLR_ENTRY_BG, fg=CLR_TEXT,
-                             relief="flat", bd=0, highlightthickness=0, wrap="none")
-        text_widget.grid(row=1, column=0, sticky="nsew", padx=16, pady=8)
-        text_widget.insert("1.0", report)
-        text_widget.configure(state="disabled")
-
-        ctk.CTkButton(result_dialog, text="确定", command=result_dialog.destroy,
-                     fg_color=CLR_ACCENT, hover_color=CLR_HOVER,
-                     font=self._ui_font(11)).grid(row=2, column=0, sticky="e", padx=16, pady=16)
-
-    async def _fetch_usage_snapshots(self, provider, keys: list[str]) -> list[tuple[str, UsageSnapshot]]:
-        """并发查询额度快照。"""
-        sem = asyncio.Semaphore(min(2, max(1, len(keys))))
-
-        async def _one(key: str) -> tuple[str, UsageSnapshot]:
-            async with sem:
-                snapshot = await provider.fetch_usage(key, timeout=20.0)
-                if snapshot is None:
-                    snapshot = UsageSnapshot(status="error", detail="当前平台未返回额度信息")
-                return key, snapshot
-
-        return await asyncio.gather(*[_one(key) for key in keys])
-
-    def _show_usage_results(self, svc: ServiceConfig, results: list[tuple[str, UsageSnapshot]]) -> None:
-        """展示额度查询结果。"""
-        ok_lines: list[str] = []
-        fail_lines: list[str] = []
-
-        for key, snapshot in results:
-            self._usage_cache[(svc.name, key)] = snapshot
-            line = self._format_usage_line(key, snapshot)
-            if snapshot.ok:
-                ok_lines.append(line)
-            else:
-                fail_lines.append(line)
-            self._log(line)
-
-        self._refresh_keys_list(svc)
-        self._log("─" * 60)
-
-        ok = len(ok_lines)
-        failed = len(fail_lines)
-        title = f"[{svc.name}] 额度查询完成：✅ {ok} 把成功  ❌ {failed} 把失败"
-        self._log(title)
-
-        result_dialog = ctk.CTkToplevel(self.root)
-        result_dialog.title("额度查询结果")
-        result_dialog.geometry("880x480")
-        result_dialog.configure(fg_color=CLR_BG)
-        self._set_modal(result_dialog)
-        result_dialog.grid_columnconfigure(0, weight=1)
-        result_dialog.grid_rowconfigure(1, weight=1)
-
-        ctk.CTkLabel(result_dialog, text=title,
-                    font=self._ui_font(13, "bold"),
-                    text_color=CLR_TEXT).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 8))
-
-        report = "\n".join(
-            [f"✅ 查询成功 ({ok} 把):"] + ok_lines +
-            ["", f"❌ 查询失败 ({failed} 把):"] + fail_lines
-        )
-        text_widget = tk.Text(result_dialog, font=self._tk_font(self.mono_font_family, 10), bg=CLR_ENTRY_BG, fg=CLR_TEXT,
-                             relief="flat", bd=0, highlightthickness=0, wrap="none")
-        text_widget.grid(row=1, column=0, sticky="nsew", padx=16, pady=8)
-        text_widget.insert("1.0", report)
-        text_widget.configure(state="disabled")
-
-        ctk.CTkButton(result_dialog, text="确定", command=result_dialog.destroy,
-                     fg_color=CLR_ACCENT, hover_color=CLR_HOVER,
-                     font=self._ui_font(11)).grid(row=2, column=0, sticky="e", padx=16, pady=16)
-
-    def _format_usage_line(self, key: str, snapshot: UsageSnapshot) -> str:
-        """格式化额度查询输出。"""
-        if not snapshot.ok:
-            return f"  ❌ {key} | {snapshot.detail}"
-
-        parts = [f"  📊 {key}"]
-        if snapshot.key_remaining is not None and snapshot.key_limit is not None and snapshot.key_usage is not None:
-            parts.append(f"密钥剩余 {snapshot.key_remaining}/{snapshot.key_limit}（已用 {snapshot.key_usage}）")
-        if snapshot.account_plan:
-            plan_part = f"套餐 {snapshot.account_plan}"
-            if snapshot.account_remaining is not None and snapshot.account_limit is not None and snapshot.account_usage is not None:
-                plan_part += f" 剩余 {snapshot.account_remaining}/{snapshot.account_limit}（已用 {snapshot.account_usage}）"
-            parts.append(plan_part)
-        if snapshot.paygo_usage is not None:
-            if snapshot.paygo_limit is not None:
-                parts.append(f"按量额度剩余 {snapshot.paygo_limit - snapshot.paygo_usage}/{snapshot.paygo_limit}")
-            else:
-                parts.append(f"按量已用 {snapshot.paygo_usage}")
-        return " | ".join(parts)
-
-    def _async_fetch_stats(self, svc: ServiceConfig) -> None:
-        """后台线程拉取网关状态。"""
-        try:
-            import httpx
-            with httpx.Client(timeout=1.0) as client:
-                r = client.get(
-                    f"http://127.0.0.1:{self._runtime_port}/stats",
-                    headers={"Authorization": f"Bearer {self._runtime_access_key}"}
+            row = ft.Row(
+                controls=[
+                    ft.Icon(icon, color=color, size=16),
+                    ft.Text(f"...{tail}", size=12, weight=ft.FontWeight.W_500, color=CLR_TEXT),
+                    ft.Text(f"{r.latency_ms}ms", size=11, color=CLR_MUTED),
+                    ft.Text(r.detail, size=11, color=color, expand=True),
+                ],
+                spacing=8,
+            )
+            result_items.append(
+                ft.Container(
+                    content=row,
+                    padding=ft.padding.symmetric(horizontal=8, vertical=6),
+                    bgcolor=CLR_CARD,
+                    border_radius=6,
                 )
-                if r.status_code == 200:
-                    self._stats_cache = r.json()
-                    self._stats_cache_time = time.time()
-                    self.root.after(0, lambda: self._refresh_keys_list(svc))
-        except Exception:
-            pass
+            )
 
-    def _refresh_mcp_example(self, svc: ServiceConfig) -> None:
-        """刷新 MCP 客户端配置示例。"""
-        port = self.port_var.get().strip() or "8080"
-        gw_key = self.gw_key_var.get().strip() or "YOUR_GATEWAY_KEY"
-        example_dict = {
-            "mcpServers": {
-                f"gateway-{svc.name}": {
-                    "type": "streamable-http",
-                    "url": f"http://127.0.0.1:{port}/{svc.name}/mcp",
-                    "headers": {"Authorization": gw_key}
-                }
-            }
-        }
-        example_json = json.dumps(example_dict, indent=2, ensure_ascii=False)
-        self.mcp_example_text.configure(state="normal")
-        self._set_text(self.mcp_example_text, example_json)
-        self.mcp_example_text.configure(state="disabled")
-
-    def _copy_mcp_example(self) -> None:
-        content = self.mcp_example_text.get("1.0", "end-1c")
-        if content.strip():
-            self.root.clipboard_clear()
-            self.root.clipboard_append(content)
-            self._log("✅ 已复制 MCP 客户端配置到剪贴板")
-
-    def _set_text(self, widget: tk.Text, value: str) -> None:
-        widget.delete("1.0", "end")
-        widget.insert("1.0", value)
-
-    def _log(self, msg: str) -> None:
-        self.log_text.insert("end", msg + "\n")
-        self.log_text.see("end")
-
-    def _restore_key_available(self, svc: ServiceConfig, key: str) -> None:
-        """将密钥恢复为可用：清本地状态，并尝试通知运行中网关。"""
-        self.state_store.reset_key(svc.name, key)
-        self._usage_cache.pop((svc.name, key), None)
-        self._stats_cache_time = 0.0
-        self._restored_keys.add((svc.name, key))
-
-        try:
-            import httpx
-            with httpx.Client(timeout=1.5) as client:
-                resp = client.post(
-                    f"http://127.0.0.1:{self._runtime_port}/admin/reset-key",
-                    headers={"Authorization": f"Bearer {self._runtime_access_key}"},
-                    json={"service": svc.name, "key": key},
-                )
-                if resp.status_code == 200:
-                    return
-        except Exception:
-            pass
-
-    def _disable_key_after_manual_test(self, svc: ServiceConfig, result) -> None:
-        """将手动测试失败的密钥禁用到下个自然月。"""
-        self.state_store.disable_key_until_next_month(
-            svc.name,
-            result.key,
-            reason=f"manual_test_failed:{result.status}",
-            raw_error=getattr(result, "raw_error", "") or result.detail,
-            raw_status_code=getattr(result, "raw_status_code", None),
+        dlg = ft.AlertDialog(
+            title=ft.Text(f"[{svc_name}] 测试完成：✅ {valid_count} 成功 / ❌ {failed_count} 失败"),
+            content=ft.Container(
+                content=ft.ListView(controls=result_items, spacing=4),
+                width=640,
+                height=380,
+            ),
+            actions=[ft.TextButton("关闭", on_click=lambda ev: self.page.close(dlg))],
+            actions_alignment=ft.MainAxisAlignment.END,
         )
-        self._restored_keys.discard((svc.name, result.key))
-        self._usage_cache.pop((svc.name, result.key), None)
-        self._stats_cache_time = 0.0
+        self.page.open(dlg)
+        self.refresh_keys_list()
+        self.refresh_service_list()
+        self.page.update()
 
-    def _add_tooltip(self, widget, text: str) -> None:
-        """为组件添加 tooltip（悬停提示）。"""
-        def on_enter(event):
-            tooltip = tk.Toplevel(widget)
-            tooltip.wm_overrideredirect(True)
-            tooltip.wm_geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
-            label = tk.Label(tooltip, text=text, background=CLR_PANEL, foreground=CLR_TEXT,
-                           font=self._ui_font(9), padx=8, pady=4, relief="solid", bd=1)
-            label.pack()
-            widget.tooltip = tooltip
+    def handle_query_usage(self, e=None) -> None:
+        """查询选中密钥额度。"""
+        if not self.selected_keys:
+            self.show_snack("请先勾选需要查询额度的密钥", CLR_WARN)
+            return
+        keys = list(self.selected_keys)
+        svc = self.manager.config.services[self.current_service_index]
 
-        def on_leave(event):
-            if hasattr(widget, 'tooltip'):
-                widget.tooltip.destroy()
-                del widget.tooltip
+        self.log(f"📊 开始查询 [{svc.name}] 的 {len(keys)} 把密钥额度...")
+        self.show_snack(f"开始查询 {len(keys)} 把密钥额度...", CLR_ACCENT)
 
-        widget.bind("<Enter>", on_enter)
-        widget.bind("<Leave>", on_leave)
+        def _worker():
+            try:
+                results = asyncio.run(
+                    self.manager.run_usage_query(self.current_service_index, keys, timeout=20.0)
+                )
+                self._show_usage_results_dialog(svc.name, results)
+            except Exception as exc:
+                self.log(f"❌ 额度查询异常: {exc}")
+                self.show_snack(f"额度查询失败: {exc}", CLR_ERROR)
 
+        threading.Thread(target=_worker, daemon=True).start()
 
-# ── 入口 ──────────────────────────────────────────────────────────────────────
-def _configure_linux_display(root: tk.Misc) -> None:
-    """修正 Linux Wayland/XWayland 下 Tk 默认缩放过小导致的字体发糊。"""
-    if not sys.platform.startswith("linux"):
-        return
-    session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
-    if session_type != "wayland" and not os.environ.get("WAYLAND_DISPLAY"):
-        return
-    try:
-        current = float(root.tk.call("tk", "scaling"))
-        # Tk 8.6 在 XWayland 下常把 1.0 当作默认值，至少提升到 1.25。
-        root.tk.call("tk", "scaling", max(current, 1.25))
-    except (tk.TclError, TypeError, ValueError):
-        pass
+    def _show_usage_results_dialog(
+        self, svc_name: str, results: list[tuple[str, UsageSnapshot]]
+    ) -> None:
+        items: list[ft.Control] = []
+        for key, snap in results:
+            line = self.manager.format_usage_line(key, snap)
+            items.append(
+                ft.Container(
+                    content=ft.Text(line, size=11, color=CLR_SUCCESS if snap.ok else CLR_ERROR),
+                    padding=ft.padding.all(6),
+                    bgcolor=CLR_CARD,
+                    border_radius=6,
+                )
+            )
 
+        dlg = ft.AlertDialog(
+            title=ft.Text(f"[{svc_name}] 额度查询结果 (共 {len(results)} 把)"),
+            content=ft.Container(
+                content=ft.ListView(controls=items, spacing=4),
+                width=640,
+                height=360,
+            ),
+            actions=[ft.TextButton("关闭", on_click=lambda ev: self.page.close(dlg))],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.open(dlg)
+        self.refresh_keys_list()
+        self.page.update()
 
-def main() -> None:
-    # 在创建窗口前先设置 DPI 感知（不需要 Tk 实例）
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
+    def handle_reset_selected(self, e=None) -> None:
+        """恢复勾选的失效密钥。"""
+        if not self.selected_keys:
+            self.show_snack("请先勾选需要恢复的密钥", CLR_WARN)
+            return
+        keys = list(self.selected_keys)
+        count = self.manager.reset_selected_keys(self.current_service_index, keys)
+        self.refresh_keys_list()
+        self.refresh_service_list()
+        self.page.update()
+        self.show_snack(f"已恢复 {count} 把密钥为可用状态！", CLR_SUCCESS)
+        self.log(f"♻️ 已恢复 {count} 把密钥可用状态")
+
+    def handle_reset_all_disabled(self, e=None) -> None:
+        """恢复当前服务所有失效密钥。"""
+        count = self.manager.reset_all_disabled_keys(self.current_service_index)
+        self.refresh_keys_list()
+        self.refresh_service_list()
+        self.page.update()
+        self.show_snack(f"已恢复全部 {count} 把失效密钥为可用状态！", CLR_SUCCESS)
+        self.log(f"♻️ 全部恢复操作：已恢复 {count} 把密钥可用状态")
+
+    def handle_single_key_restore(self, key: str) -> None:
+        svc = self.manager.config.services[self.current_service_index]
+        self.manager.restore_key_available(svc.name, key)
+        self.refresh_keys_list()
+        self.refresh_service_list()
+        self.page.update()
+        self.show_snack(f"密钥 ...{key[-6:]} 已恢复可用！", CLR_SUCCESS)
+
+    def handle_delete_selected(self, e=None) -> None:
+        """删除勾选的密钥。"""
+        if not self.selected_keys:
+            self.show_snack("请先勾选需要删除的密钥", CLR_WARN)
+            return
+
+        def do_delete(ev):
+            self.page.close(dlg)
+            keys = list(self.selected_keys)
+            count = self.manager.delete_selected_keys(self.current_service_index, keys)
+            self.selected_keys.clear()
+            self.manager.write_config_to_disk()
+            self.refresh_keys_list()
+            self.refresh_service_list()
+            self.page.update()
+            self.show_snack(f"已删除 {count} 把密钥", CLR_SUCCESS)
+            self.log(f"🗑️ 已删除选中的 {count} 把密钥")
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("确认删除选中的密钥？"),
+            content=ft.Text(f"即将删除 {len(self.selected_keys)} 把密钥，此操作不可撤销。"),
+            actions=[
+                ft.TextButton("取消", on_click=lambda ev: self.page.close(dlg)),
+                ft.FilledButton("确认删除", style=ft.ButtonStyle(bgcolor=CLR_ERROR), on_click=do_delete),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.open(dlg)
+
+    def handle_single_key_delete(self, key: str) -> None:
+        def do_delete(ev):
+            self.page.close(dlg)
+            self.manager.delete_selected_keys(self.current_service_index, [key])
+            self.selected_keys.discard(key)
+            self.manager.write_config_to_disk()
+            self.refresh_keys_list()
+            self.refresh_service_list()
+            self.page.update()
+            self.show_snack("密钥已删除", CLR_SUCCESS)
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("确认删除该密钥？"),
+            content=ft.Text(f"密钥: ...{key[-8:]}\n此操作不可撤销。"),
+            actions=[
+                ft.TextButton("取消", on_click=lambda ev: self.page.close(dlg)),
+                ft.FilledButton("确认删除", style=ft.ButtonStyle(bgcolor=CLR_ERROR), on_click=do_delete),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.open(dlg)
+
+    def handle_show_raw_errors(self, e=None) -> None:
+        """查看选中密钥的原始失败报文。"""
+        if not self.selected_keys:
+            self.show_snack("请先勾选要查看报错的密钥", CLR_WARN)
+            return
+        keys = list(self.selected_keys)
+        reports = self.manager.get_key_raw_errors(self.current_service_index, keys)
+
+        text_content = "\n\n" + ("=" * 40 + "\n\n").join(reports)
+        dlg = ft.AlertDialog(
+            title=ft.Text("原始错误报文详情"),
+            content=ft.Container(
+                content=ft.TextField(
+                    value=text_content,
+                    read_only=True,
+                    multiline=True,
+                    min_lines=12,
+                    text_size=11,
+                ),
+                width=680,
+                height=400,
+            ),
+            actions=[ft.TextButton("关闭", on_click=lambda ev: self.page.close(dlg))],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.open(dlg)
+
+    def handle_copy_mcp_config(self, e=None) -> None:
+        self._copy_text(self.mcp_config_display.value or "", "MCP 客户端配置已复制到剪贴板！")
+
+    def handle_clear_logs(self, e=None) -> None:
+        self.log_listview.controls.clear()
+        self.page.update()
+
+    # ── 辅助与后台轮询 ────────────────────────────────────────────────────────
+    def _copy_text(self, text: str, toast: str) -> None:
+        self.page.set_clipboard(text)
+        self.show_snack(toast, CLR_ACCENT)
+
+    def log(self, message: str) -> None:
+        """向日志标签页输出一行日志。"""
+        t_str = time.strftime("%H:%M:%S")
+        self.log_listview.controls.append(
+            ft.Text(f"[{t_str}] {message}", size=11, color=CLR_TEXT, font_family=resolve_mono_font_family())
+        )
         try:
-            ctypes.windll.user32.SetProcessDPIAware()
+            self.page.update()
         except Exception:
             pass
-    root = ctk.CTk()
-    _configure_linux_display(root)
-    root.configure(fg_color=CLR_BG)
-    GatewayEditor(root)
-    root.mainloop()
+
+    def show_snack(self, message: str, color: str = CLR_ACCENT) -> None:
+        """弹出底部轻量通知。"""
+        sb = ft.SnackBar(
+            content=ft.Text(message, color=ft.Colors.WHITE, size=12),
+            bgcolor=color,
+            show_close_icon=True,
+        )
+        self.page.open(sb)
+
+    def _start_background_polling(self) -> None:
+        """启动后台健康状态检查与密钥持久化文件变动检测。"""
+        def _poll():
+            while self._poll_running:
+                time.sleep(2.0)
+                # 检查网关健康
+                is_up = self.manager.is_gateway_healthy()
+                self.status_indicator.bgcolor = CLR_SUCCESS if is_up else ft.Colors.GREY_500
+                self.status_text.value = f"运行中 (端口 {self.manager.runtime_port})" if is_up else "已停止"
+                self.status_text.color = CLR_SUCCESS if is_up else CLR_MUTED
+
+                # 检查状态文件变动
+                try:
+                    mtime = os.stat(self.manager.state_store.path).st_mtime_ns
+                    if mtime != self._key_state_mtime:
+                        self._key_state_mtime = mtime
+                        self.manager.fetch_stats()
+                        self.refresh_keys_list()
+                        self.refresh_service_list()
+                except Exception:
+                    pass
+
+                try:
+                    self.page.update()
+                except Exception:
+                    break
+
+        threading.Thread(target=_poll, daemon=True).start()
+
+
+def _configure_windows_dpi() -> None:
+    """Windows 下启用高分屏 DPI 感知。"""
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+
+def main(page: ft.Page) -> None:
+    """Flet 客户端主入口。"""
+    page.title = APP_TITLE
+    page.theme_mode = ft.ThemeMode.DARK
+    page.theme = ft.Theme(font_family=resolve_ui_font_family())
+    page.window.width = 1200
+    page.window.height = 800
+    page.window.min_width = 880
+    page.window.min_height = 580
+    page.window.center()
+    page.padding = 0
+    page.spacing = 0
+
+    GatewayAppUI(page)
 
 
 if __name__ == "__main__":
-    main()
+    _configure_windows_dpi()
+    ft.app(target=main)
