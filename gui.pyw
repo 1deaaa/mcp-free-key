@@ -81,6 +81,125 @@ def resolve_mono_font_family() -> str:
     return "monospace"
 
 
+# ── Linux 原生桌面兼容性与自愈垫片 ──────────────────────────────────────────────
+_LINUX_COMPAT_INITIALIZED = False
+
+
+def _find_system_libmpv() -> str | None:
+    """探测 Linux 系统中实际存在的 libmpv 共享库路径（如 libmpv.so.2 等）。"""
+    candidate_paths = [
+        "/usr/lib/x86_64-linux-gnu/libmpv.so.2",
+        "/usr/lib/aarch64-linux-gnu/libmpv.so.2",
+        "/usr/lib64/libmpv.so.2",
+        "/usr/lib/libmpv.so.2",
+        "/usr/local/lib/libmpv.so.2",
+        "/usr/local/lib64/libmpv.so.2",
+        "/usr/lib/x86_64-linux-gnu/libmpv.so",
+        "/usr/lib/aarch64-linux-gnu/libmpv.so",
+        "/usr/lib64/libmpv.so",
+        "/usr/lib/libmpv.so",
+    ]
+    for p in candidate_paths:
+        if os.path.isfile(p):
+            return p
+
+    # 兜底：使用 ldconfig -p 扫描动态链接器缓存
+    try:
+        import subprocess
+
+        out = subprocess.check_output(
+            ["/sbin/ldconfig", "-p"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=1.5,
+        )
+        for line in out.splitlines():
+            if "libmpv.so" in line and "=>" in line:
+                p = line.split("=>")[-1].strip()
+                if os.path.isfile(p):
+                    return p
+    except Exception:
+        pass
+    return None
+
+
+def _ensure_linux_native_compat() -> None:
+    """面向现代 Linux（如 Ubuntu 26.04+）的 Flet 原生桌面运行时自愈垫片。
+
+    背景与机理：
+    1. Flet 0.28.x 原生桌面客户端写死链接旧版 libmpv.so.1。
+    2. 而在 Ubuntu 26.04 等现代发行版中，系统仅标配 libmpv.so.2，直接启动会触发缺失动态库错误。
+    3. 本垫片在用户空间建立安全的隔离符号链接，并注入 LD_LIBRARY_PATH，
+       使 Flet 的原生子进程能够无感加载，无需修改系统文件，无需 root / patchelf。
+    4. 注入 Wayland / GTK3 回退环境，避免 KDE Plasma 6 下的关窗悬垂指针崩溃。
+    """
+    global _LINUX_COMPAT_INITIALIZED
+    if _LINUX_COMPAT_INITIALIZED or not sys.platform.startswith("linux"):
+        return
+
+    _LINUX_COMPAT_INITIALIZED = True
+
+    # 1. 注入 GTK/Wayland 稳定性回退，避免 KDE Plasma 6 下 GTK3 窗口销毁竞态
+    os.environ.setdefault("GDK_BACKEND", "x11,wayland")
+
+    # 2. 检查系统是否已直接拥有 libmpv.so.1
+    has_mpv1 = False
+    for p in [
+        "/usr/lib/x86_64-linux-gnu/libmpv.so.1",
+        "/usr/lib/aarch64-linux-gnu/libmpv.so.1",
+        "/usr/lib64/libmpv.so.1",
+        "/usr/lib/libmpv.so.1",
+    ]:
+        if os.path.isfile(p):
+            has_mpv1 = True
+            break
+
+    if has_mpv1:
+        return
+
+    # 3. 寻找系统中的新版 libmpv (如 libmpv.so.2)
+    real_mpv = _find_system_libmpv()
+    if not real_mpv:
+        return
+
+    # 4. 在用户私有目录创建兼容符号链接
+    compat_dir = os.path.join(os.path.expanduser("~"), ".flet", "compat_libs")
+    try:
+        os.makedirs(compat_dir, exist_ok=True)
+        link_target = os.path.join(compat_dir, "libmpv.so.1")
+        if not os.path.exists(link_target):
+            try:
+                os.symlink(real_mpv, link_target)
+            except OSError:
+                pass
+
+        # 双保险：若 ~/.flet/bin/flet-*/flet/lib 目录已存在，顺便在此也补齐软链接
+        flet_bin_root = os.path.join(os.path.expanduser("~"), ".flet", "bin")
+        if os.path.isdir(flet_bin_root):
+            for entry in os.listdir(flet_bin_root):
+                lib_dir = os.path.join(flet_bin_root, entry, "flet", "lib")
+                if os.path.isdir(lib_dir):
+                    flet_link = os.path.join(lib_dir, "libmpv.so.1")
+                    if not os.path.exists(flet_link):
+                        try:
+                            os.symlink(real_mpv, flet_link)
+                        except OSError:
+                            pass
+
+        # 5. 注入到 LD_LIBRARY_PATH，使 Flet 原生子进程启动时能够优先解析
+        curr_ld = os.environ.get("LD_LIBRARY_PATH", "")
+        if compat_dir not in curr_ld.split(os.pathsep):
+            os.environ["LD_LIBRARY_PATH"] = (
+                f"{compat_dir}{os.pathsep}{curr_ld}" if curr_ld else compat_dir
+            )
+    except Exception:
+        pass
+
+
+# 模块级首次加载即预初始化垫片环境
+_ensure_linux_native_compat()
+
+
 class GatewayAppUI:
     """Flet 界面控制器与组件构建器。"""
 
@@ -1689,6 +1808,16 @@ class GatewayAppUI:
 
         threading.Thread(target=_poll, daemon=True).start()
 
+    def cleanup(self) -> None:
+        """安全释放后台资源，停止轮询与延时任务，避免关窗时向注销页面推送更新。"""
+        self._poll_running = False
+        if self._auto_apply_timer:
+            try:
+                self._auto_apply_timer.cancel()
+            except Exception:
+                pass
+            self._auto_apply_timer = None
+
 
 def _configure_windows_dpi() -> None:
     """Windows 下启用高分屏 DPI 感知。"""
@@ -1715,9 +1844,32 @@ def main(page: ft.Page) -> None:
     page.padding = 0
     page.spacing = 0
 
-    GatewayAppUI(page)
+    app_ui = GatewayAppUI(page)
+
+    # ── 优雅退出守卫 (Graceful Close Guard) ──────────────────────────────────
+    # 拦截操作系统原生关窗信号，有序切断后台更新后再显式销毁窗口，杜绝 Linux GTK3 悬垂指针 SIGSEGV
+    try:
+        page.window.prevent_close = True
+
+        def on_window_event(e: ft.ControlEvent) -> None:
+            if getattr(e, "data", None) == "close":
+                app_ui.cleanup()
+                try:
+                    page.window.prevent_close = False
+                    page.window.destroy()
+                except Exception:
+                    pass
+
+        def on_disconnect(e: ft.ControlEvent) -> None:
+            app_ui.cleanup()
+
+        page.window.on_event = on_window_event
+        page.on_disconnect = on_disconnect
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
+    _ensure_linux_native_compat()
     _configure_windows_dpi()
     ft.app(target=main)
