@@ -131,7 +131,7 @@ def _ensure_linux_native_compat() -> None:
     2. 而在 Ubuntu 26.04 等现代发行版中，系统仅标配 libmpv.so.2，直接启动会触发缺失动态库错误。
     3. 本垫片在用户空间建立安全的隔离符号链接，并注入 LD_LIBRARY_PATH，
        使 Flet 的原生子进程能够无感加载，无需修改系统文件，无需 root / patchelf。
-    4. 注入 Wayland / GTK3 回退环境，避免 KDE Plasma 6 下的关窗悬垂指针崩溃。
+    4. Flet 0.28.3 的 Linux 窗口插件在 KDE Wayland 下关闭握手不稳定；有 Xwayland 时使用 X11 兼容后端。
     """
     global _LINUX_COMPAT_INITIALIZED
     if _LINUX_COMPAT_INITIALIZED or not sys.platform.startswith("linux"):
@@ -139,10 +139,15 @@ def _ensure_linux_native_compat() -> None:
 
     _LINUX_COMPAT_INITIALIZED = True
 
-    # 1. 注入 GTK/Wayland 稳定性回退，避免 KDE Plasma 6 下 GTK3 窗口销毁竞态
-    os.environ.setdefault("GDK_BACKEND", "x11,wayland")
+    # Flet 0.28.3 的 GTK 窗口插件在 KDE Wayland 下可能无法正常完成关闭。
+    # 有 Xwayland 时使用 X11 兼容层；纯 Wayland 环境仍保留系统默认后端。
+    is_wayland_session = bool(os.environ.get("WAYLAND_DISPLAY")) or (
+        os.environ.get("XDG_SESSION_TYPE") == "wayland"
+    )
+    if is_wayland_session and os.environ.get("DISPLAY"):
+        os.environ["GDK_BACKEND"] = "x11"
 
-    # 2. 检查系统是否已直接拥有 libmpv.so.1
+    # 1. 检查系统是否已直接拥有 libmpv.so.1
     has_mpv1 = False
     for p in [
         "/usr/lib/x86_64-linux-gnu/libmpv.so.1",
@@ -157,12 +162,12 @@ def _ensure_linux_native_compat() -> None:
     if has_mpv1:
         return
 
-    # 3. 寻找系统中的新版 libmpv (如 libmpv.so.2)
+    # 2. 寻找系统中的新版 libmpv (如 libmpv.so.2)
     real_mpv = _find_system_libmpv()
     if not real_mpv:
         return
 
-    # 4. 在用户私有目录创建兼容符号链接
+    # 3. 在用户私有目录创建兼容符号链接
     compat_dir = os.path.join(os.path.expanduser("~"), ".flet", "compat_libs")
     try:
         os.makedirs(compat_dir, exist_ok=True)
@@ -186,7 +191,7 @@ def _ensure_linux_native_compat() -> None:
                         except OSError:
                             pass
 
-        # 5. 注入到 LD_LIBRARY_PATH，使 Flet 原生子进程启动时能够优先解析
+        # 4. 注入到 LD_LIBRARY_PATH，使 Flet 原生子进程启动时能够优先解析
         curr_ld = os.environ.get("LD_LIBRARY_PATH", "")
         if compat_dir not in curr_ld.split(os.pathsep):
             os.environ["LD_LIBRARY_PATH"] = (
@@ -198,6 +203,17 @@ def _ensure_linux_native_compat() -> None:
 
 # 模块级首次加载即预初始化垫片环境
 _ensure_linux_native_compat()
+
+
+def _synchronized_ui_method(method: Callable[..., Any]) -> Callable[..., Any]:
+    """串行执行会修改控件树的界面方法，并在关闭后直接忽略迟到调用。"""
+    def wrapper(self, *args: Any, **kwargs: Any) -> Any:
+        with self._page_command_lock:
+            if self._closing:
+                return None
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 class GatewayAppUI:
@@ -214,12 +230,41 @@ class GatewayAppUI:
         self._auto_apply_timer: threading.Timer | None = None
         self._key_state_mtime: int | None = None
         self._poll_running = True
+        self._poll_stop = threading.Event()
+        # 所有 Flet 页面命令与控件树修改共用一把可重入锁，关窗时可等待当前命令完成。
+        self._page_command_lock = threading.RLock()
+        self._closing = False
 
         # 构建所有控件实例
         self._init_controls()
+        # 清理页面中的默认控件后再挂载完整工作台。
+        self._page_call(self.page.clean)
         self._build_layout()
         self._load_data()
         self._start_background_polling()
+
+    def _page_call(self, callback: Callable[[], Any]) -> Any | None:
+        """在页面生命周期锁内执行 Flet 命令，关闭后拒绝新的原生调用。"""
+        with self._page_command_lock:
+            if self._closing:
+                return None
+            try:
+                return callback()
+            except Exception:
+                # 页面断开或原生窗口正在退出时，忽略迟到的 UI 命令。
+                return None
+
+    def _page_update(self) -> None:
+        """安全更新页面。"""
+        self._page_call(self.page.update)
+
+    def _page_open(self, control: ft.Control) -> None:
+        """安全打开页面浮层。"""
+        self._page_call(lambda: self.page.open(control))
+
+    def _page_close(self, control: ft.Control) -> None:
+        """安全关闭页面浮层。"""
+        self._page_call(lambda: self.page.close(control))
 
     # ── 控件初始化 ────────────────────────────────────────────────────────────
     def _init_controls(self) -> None:
@@ -440,17 +485,16 @@ class GatewayAppUI:
             spacing=0,
         )
 
-        self.page.add(
-            ft.Container(
-                content=ft.Column(
-                    controls=[top_bar, ft.Divider(height=1, color=CLR_BORDER), body_row],
-                    spacing=0,
-                    expand=True,
-                ),
+        root = ft.Container(
+            content=ft.Column(
+                controls=[top_bar, ft.Divider(height=1, color=CLR_BORDER), body_row],
+                spacing=0,
                 expand=True,
-                bgcolor=CLR_BG,
-            )
+            ),
+            expand=True,
+            bgcolor=CLR_BG,
         )
+        self._page_call(lambda: self.page.add(root))
 
     def _build_top_bar(self) -> ft.Container:
         """构建现代顶部导航栏与网关快捷设置。"""
@@ -942,6 +986,7 @@ class GatewayAppUI:
         if 0 <= self.current_service_index < len(self.manager.config.services):
             self.load_service(self.current_service_index)
 
+    @_synchronized_ui_method
     def load_service(self, index: int) -> None:
         """将指定服务的配置加载到工作区。"""
         if not (0 <= index < len(self.manager.config.services)):
@@ -962,8 +1007,9 @@ class GatewayAppUI:
         self.refresh_keys_list()
         self._refresh_mcp_config()
         self.refresh_service_list()
-        self.page.update()
+        self._page_update()
 
+    @_synchronized_ui_method
     def refresh_service_list(self) -> None:
         """刷新左侧服务卡片列表。"""
         self.services_listview.controls.clear()
@@ -1022,11 +1068,11 @@ class GatewayAppUI:
             )
             self.services_listview.controls.append(card)
 
+    @_synchronized_ui_method
     def refresh_keys_list(self) -> None:
         """根据搜索与状态过滤器渲染当前服务的密钥列表。"""
         self.keys_listview.controls.clear()
         if not (0 <= self.current_service_index < len(self.manager.config.services)):
-            self.page.update()
             return
 
         items = self.manager.get_key_display_items(self.current_service_index)
@@ -1063,7 +1109,6 @@ class GatewayAppUI:
                     padding=ft.padding.all(30),
                 )
             )
-            self.page.update()
             return
 
         for it in filtered_items:
@@ -1170,10 +1215,11 @@ class GatewayAppUI:
             svc.name, self.mcp_client_type
         )
 
+    @_synchronized_ui_method
     def _switch_mcp_client(self, client_type: str) -> None:
         self.mcp_client_type = client_type
         self._refresh_mcp_config()
-        self.page.update()
+        self._page_update()
 
     # ── 交互事件处理 ──────────────────────────────────────────────────────────
     def _on_gateway_setting_change(self, e=None) -> None:
@@ -1199,6 +1245,7 @@ class GatewayAppUI:
         except Exception as exc:
             self.log(f"⚠️ 配置校验警告: {exc}")
 
+    @_synchronized_ui_method
     def _on_service_toggle(self, index: int, enabled: bool) -> None:
         """服务启用开关切换。"""
         if 0 <= index < len(self.manager.config.services):
@@ -1207,7 +1254,7 @@ class GatewayAppUI:
                 self.svc_enabled_switch.value = enabled
             self._schedule_auto_apply()
             self.refresh_service_list()
-            self.page.update()
+            self._page_update()
 
     def _schedule_auto_apply(self) -> None:
         """防抖自动应用。"""
@@ -1316,12 +1363,12 @@ class GatewayAppUI:
                     key_param=auth_param_input.value.strip() or "Authorization",
                     failure_patterns=patterns,
                 )
-                self.page.close(dlg)
+                self._page_close(dlg)
                 self.manager.write_config_to_disk()
                 new_index = len(self.manager.config.services) - 1
                 self.load_service(new_index)
                 self.refresh_service_list()
-                self.page.update()
+                self._page_update()
                 self.log(f"➕ 成功添加第三方 MCP 服务: [{name_val}] -> {url_val}")
                 self.show_snack(f"成功添加服务 [{name_val}]！", CLR_SUCCESS)
             except Exception as exc:
@@ -1343,12 +1390,12 @@ class GatewayAppUI:
                 width=540,
             ),
             actions=[
-                ft.TextButton("取消", on_click=lambda ev: self.page.close(dlg)),
+                ft.TextButton("取消", on_click=lambda ev: self._page_close(dlg)),
                 ft.FilledButton("确认添加", on_click=do_confirm),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
-        self.page.open(dlg)
+        self._page_open(dlg)
 
     def handle_delete_service(self, e=None) -> None:
         """删除当前选中的服务。"""
@@ -1360,7 +1407,7 @@ class GatewayAppUI:
         svc_name = svc.name
 
         def do_delete(ev):
-            self.page.close(dlg)
+            self._page_close(dlg)
             self.manager.delete_service(self.current_service_index)
             self.manager.write_config_to_disk()
             self.current_service_index = 0 if self.manager.config.services else -1
@@ -1369,7 +1416,7 @@ class GatewayAppUI:
             else:
                 self.keys_listview.controls.clear()
                 self.services_listview.controls.clear()
-                self.page.update()
+                self._page_update()
             self.refresh_service_list()
             self.log(f"🗑️ 已删除服务: [{svc_name}]")
             self.show_snack(f"服务 [{svc_name}] 已删除", CLR_SUCCESS)
@@ -1379,12 +1426,12 @@ class GatewayAppUI:
             title=ft.Text("确认删除该服务？"),
             content=ft.Text(f"即将删除服务 [{svc_name}] 及其全部 {len(svc.keys)} 把密钥。\n此操作不可撤销。"),
             actions=[
-                ft.TextButton("取消", on_click=lambda ev: self.page.close(dlg)),
+                ft.TextButton("取消", on_click=lambda ev: self._page_close(dlg)),
                 ft.FilledButton("确认删除", style=ft.ButtonStyle(bgcolor=CLR_ERROR), on_click=do_delete),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
-        self.page.open(dlg)
+        self._page_open(dlg)
 
     def handle_save_config(self, e=None) -> None:
         """手动点击立即应用配置。"""
@@ -1437,7 +1484,7 @@ class GatewayAppUI:
         else:
             self.selected_keys.discard(key)
         self.refresh_keys_list()
-        self.page.update()
+        self._page_update()
 
     def handle_select_all_toggle(self, e=None) -> None:
         if not (0 <= self.current_service_index < len(self.manager.config.services)):
@@ -1448,17 +1495,17 @@ class GatewayAppUI:
         else:
             self.selected_keys.clear()
         self.refresh_keys_list()
-        self.page.update()
+        self._page_update()
 
     def handle_search_change(self, e=None) -> None:
         self.search_filter = self.search_input.value.strip()
         self.refresh_keys_list()
-        self.page.update()
+        self._page_update()
 
     def handle_filter_change(self, e=None) -> None:
         self.status_filter = self.filter_dropdown.value
         self.refresh_keys_list()
-        self.page.update()
+        self._page_update()
 
     def handle_import_keys(self, e=None) -> None:
         """打开批量导入密钥弹窗。"""
@@ -1479,11 +1526,11 @@ class GatewayAppUI:
         def do_confirm(ev):
             raw = text_input.value or ""
             new_count, all_keys = self.manager.import_keys(self.current_service_index, raw)
-            self.page.close(dlg)
+            self._page_close(dlg)
             self.manager.write_config_to_disk()
             self.refresh_keys_list()
             self.refresh_service_list()
-            self.page.update()
+            self._page_update()
             self.log(f"📥 批量导入完成: 新增 {new_count} 把密钥 (当前总数: {len(all_keys)})")
             self.show_snack(f"成功导入 {new_count} 把新密钥！", CLR_SUCCESS)
 
@@ -1492,12 +1539,12 @@ class GatewayAppUI:
             title=ft.Text("📥 批量导入密钥"),
             content=ft.Container(content=text_input, width=540),
             actions=[
-                ft.TextButton("取消", on_click=lambda ev: self.page.close(dlg)),
+                ft.TextButton("取消", on_click=lambda ev: self._page_close(dlg)),
                 ft.FilledButton("导入", on_click=do_confirm),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
-        self.page.open(dlg)
+        self._page_open(dlg)
 
     def handle_test_selected(self, e=None) -> None:
         """测试勾选的密钥。"""
@@ -1541,6 +1588,7 @@ class GatewayAppUI:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    @_synchronized_ui_method
     def _show_validation_results_dialog(self, svc_name: str, results: list[ValidationResult]) -> None:
         """展示测试结果弹窗。"""
         valid_count = sum(1 for r in results if r.status == "valid")
@@ -1577,13 +1625,13 @@ class GatewayAppUI:
                 width=640,
                 height=380,
             ),
-            actions=[ft.TextButton("关闭", on_click=lambda ev: self.page.close(dlg))],
+            actions=[ft.TextButton("关闭", on_click=lambda ev: self._page_close(dlg))],
             actions_alignment=ft.MainAxisAlignment.END,
         )
-        self.page.open(dlg)
+        self._page_open(dlg)
         self.refresh_keys_list()
         self.refresh_service_list()
-        self.page.update()
+        self._page_update()
 
     def handle_query_usage(self, e=None) -> None:
         """查询选中密钥额度。"""
@@ -1608,6 +1656,7 @@ class GatewayAppUI:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    @_synchronized_ui_method
     def _show_usage_results_dialog(
         self, svc_name: str, results: list[tuple[str, UsageSnapshot]]
     ) -> None:
@@ -1630,12 +1679,12 @@ class GatewayAppUI:
                 width=640,
                 height=360,
             ),
-            actions=[ft.TextButton("关闭", on_click=lambda ev: self.page.close(dlg))],
+            actions=[ft.TextButton("关闭", on_click=lambda ev: self._page_close(dlg))],
             actions_alignment=ft.MainAxisAlignment.END,
         )
-        self.page.open(dlg)
+        self._page_open(dlg)
         self.refresh_keys_list()
-        self.page.update()
+        self._page_update()
 
     def handle_reset_selected(self, e=None) -> None:
         """恢复勾选的失效密钥。"""
@@ -1646,7 +1695,7 @@ class GatewayAppUI:
         count = self.manager.reset_selected_keys(self.current_service_index, keys)
         self.refresh_keys_list()
         self.refresh_service_list()
-        self.page.update()
+        self._page_update()
         self.show_snack(f"已恢复 {count} 把密钥为可用状态！", CLR_SUCCESS)
         self.log(f"♻️ 已恢复 {count} 把密钥可用状态")
 
@@ -1655,7 +1704,7 @@ class GatewayAppUI:
         count = self.manager.reset_all_disabled_keys(self.current_service_index)
         self.refresh_keys_list()
         self.refresh_service_list()
-        self.page.update()
+        self._page_update()
         self.show_snack(f"已恢复全部 {count} 把失效密钥为可用状态！", CLR_SUCCESS)
         self.log(f"♻️ 全部恢复操作：已恢复 {count} 把密钥可用状态")
 
@@ -1664,7 +1713,7 @@ class GatewayAppUI:
         self.manager.restore_key_available(svc.name, key)
         self.refresh_keys_list()
         self.refresh_service_list()
-        self.page.update()
+        self._page_update()
         self.show_snack(f"密钥 ...{key[-6:]} 已恢复可用！", CLR_SUCCESS)
 
     def handle_delete_selected(self, e=None) -> None:
@@ -1674,14 +1723,14 @@ class GatewayAppUI:
             return
 
         def do_delete(ev):
-            self.page.close(dlg)
+            self._page_close(dlg)
             keys = list(self.selected_keys)
             count = self.manager.delete_selected_keys(self.current_service_index, keys)
             self.selected_keys.clear()
             self.manager.write_config_to_disk()
             self.refresh_keys_list()
             self.refresh_service_list()
-            self.page.update()
+            self._page_update()
             self.show_snack(f"已删除 {count} 把密钥", CLR_SUCCESS)
             self.log(f"🗑️ 已删除选中的 {count} 把密钥")
 
@@ -1690,22 +1739,22 @@ class GatewayAppUI:
             title=ft.Text("确认删除选中的密钥？"),
             content=ft.Text(f"即将删除 {len(self.selected_keys)} 把密钥，此操作不可撤销。"),
             actions=[
-                ft.TextButton("取消", on_click=lambda ev: self.page.close(dlg)),
+                ft.TextButton("取消", on_click=lambda ev: self._page_close(dlg)),
                 ft.FilledButton("确认删除", style=ft.ButtonStyle(bgcolor=CLR_ERROR), on_click=do_delete),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
-        self.page.open(dlg)
+        self._page_open(dlg)
 
     def handle_single_key_delete(self, key: str) -> None:
         def do_delete(ev):
-            self.page.close(dlg)
+            self._page_close(dlg)
             self.manager.delete_selected_keys(self.current_service_index, [key])
             self.selected_keys.discard(key)
             self.manager.write_config_to_disk()
             self.refresh_keys_list()
             self.refresh_service_list()
-            self.page.update()
+            self._page_update()
             self.show_snack("密钥已删除", CLR_SUCCESS)
 
         dlg = ft.AlertDialog(
@@ -1713,12 +1762,12 @@ class GatewayAppUI:
             title=ft.Text("确认删除该密钥？"),
             content=ft.Text(f"密钥: ...{key[-8:]}\n此操作不可撤销。"),
             actions=[
-                ft.TextButton("取消", on_click=lambda ev: self.page.close(dlg)),
+                ft.TextButton("取消", on_click=lambda ev: self._page_close(dlg)),
                 ft.FilledButton("确认删除", style=ft.ButtonStyle(bgcolor=CLR_ERROR), on_click=do_delete),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
-        self.page.open(dlg)
+        self._page_open(dlg)
 
     def handle_show_raw_errors(self, e=None) -> None:
         """查看选中密钥的原始失败报文。"""
@@ -1742,33 +1791,31 @@ class GatewayAppUI:
                 width=680,
                 height=400,
             ),
-            actions=[ft.TextButton("关闭", on_click=lambda ev: self.page.close(dlg))],
+            actions=[ft.TextButton("关闭", on_click=lambda ev: self._page_close(dlg))],
             actions_alignment=ft.MainAxisAlignment.END,
         )
-        self.page.open(dlg)
+        self._page_open(dlg)
 
     def handle_copy_mcp_config(self, e=None) -> None:
         self._copy_text(self.mcp_config_display.value or "", "MCP 客户端配置已复制到剪贴板！")
 
     def handle_clear_logs(self, e=None) -> None:
         self.log_listview.controls.clear()
-        self.page.update()
+        self._page_update()
 
     # ── 辅助与后台轮询 ────────────────────────────────────────────────────────
     def _copy_text(self, text: str, toast: str) -> None:
-        self.page.set_clipboard(text)
+        self._page_call(lambda: self.page.set_clipboard(text))
         self.show_snack(toast, CLR_ACCENT)
 
+    @_synchronized_ui_method
     def log(self, message: str) -> None:
         """向日志标签页输出一行日志。"""
         t_str = time.strftime("%H:%M:%S")
         self.log_listview.controls.append(
             ft.Text(f"[{t_str}] {message}", size=11, color=CLR_TEXT, font_family=resolve_mono_font_family())
         )
-        try:
-            self.page.update()
-        except Exception:
-            pass
+        self._page_update()
 
     def show_snack(self, message: str, color: str = CLR_ACCENT) -> None:
         """弹出底部轻量通知。"""
@@ -1777,46 +1824,52 @@ class GatewayAppUI:
             bgcolor=color,
             show_close_icon=True,
         )
-        self.page.open(sb)
+        self._page_open(sb)
 
     def _start_background_polling(self) -> None:
         """启动后台健康状态检查与密钥持久化文件变动检测。"""
         def _poll():
-            while self._poll_running:
-                time.sleep(2.0)
+            while self._poll_running and not self._poll_stop.wait(2.0):
+                if self._closing:
+                    break
                 # 检查网关健康
                 is_up = self.manager.is_gateway_healthy()
-                self.status_indicator.bgcolor = CLR_SUCCESS if is_up else ft.Colors.GREY_500
-                self.status_text.value = f"运行中 (端口 {self.manager.runtime_port})" if is_up else "已停止"
-                self.status_text.color = CLR_SUCCESS if is_up else CLR_MUTED
+                with self._page_command_lock:
+                    if self._closing:
+                        break
+                    self.status_indicator.bgcolor = CLR_SUCCESS if is_up else ft.Colors.GREY_500
+                    self.status_text.value = f"运行中 (端口 {self.manager.runtime_port})" if is_up else "已停止"
 
-                # 检查状态文件变动
-                try:
-                    mtime = os.stat(self.manager.state_store.path).st_mtime_ns
-                    if mtime != self._key_state_mtime:
-                        self._key_state_mtime = mtime
-                        self.manager.fetch_stats()
-                        self.refresh_keys_list()
-                        self.refresh_service_list()
-                except Exception:
-                    pass
+                    # 检查状态文件变动
+                    try:
+                        mtime = os.stat(self.manager.state_store.path).st_mtime_ns
+                        if mtime != self._key_state_mtime:
+                            self._key_state_mtime = mtime
+                            self.manager.fetch_stats()
+                            self.refresh_keys_list()
+                            self.refresh_service_list()
+                    except Exception:
+                        pass
 
-                try:
-                    self.page.update()
-                except Exception:
-                    break
+                    self._page_update()
 
         threading.Thread(target=_poll, daemon=True).start()
 
     def cleanup(self) -> None:
-        """安全释放后台资源，停止轮询与延时任务，避免关窗时向注销页面推送更新。"""
-        self._poll_running = False
-        if self._auto_apply_timer:
+        """停止后台任务并等待当前页面命令完成，不再向原生窗口发送命令。"""
+        with self._page_command_lock:
+            if self._closing:
+                return
+            self._closing = True
+            self._poll_running = False
+            self._poll_stop.set()
+            timer = self._auto_apply_timer
+            self._auto_apply_timer = None
+        if timer:
             try:
-                self._auto_apply_timer.cancel()
+                timer.cancel()
             except Exception:
                 pass
-            self._auto_apply_timer = None
 
 
 def _configure_windows_dpi() -> None:
@@ -1831,7 +1884,7 @@ def _configure_windows_dpi() -> None:
                 pass
 
 
-def main(page: ft.Page) -> None:
+async def main(page: ft.Page) -> None:
     """Flet 客户端主入口。"""
     page.title = APP_TITLE
     page.theme_mode = ft.ThemeMode.DARK
@@ -1840,33 +1893,32 @@ def main(page: ft.Page) -> None:
     page.window.height = 800
     page.window.min_width = 880
     page.window.min_height = 580
-    page.window.center()
+    # 初始化完成前隐藏原生窗口，避免加载期间出现空白窗口或接受关闭竞态。
+    page.window.wait_until_ready_to_show = True
+    page.window.visible = False
     page.padding = 0
     page.spacing = 0
 
-    app_ui = GatewayAppUI(page)
+    app_ui: GatewayAppUI | None = None
 
-    # ── 优雅退出守卫 (Graceful Close Guard) ──────────────────────────────────
-    # 拦截操作系统原生关窗信号，有序切断后台更新后再显式销毁窗口，杜绝 Linux GTK3 悬垂指针 SIGSEGV
-    try:
-        page.window.prevent_close = True
-
-        def on_window_event(e: ft.ControlEvent) -> None:
-            if getattr(e, "data", None) == "close":
-                app_ui.cleanup()
-                try:
-                    page.window.prevent_close = False
-                    page.window.destroy()
-                except Exception:
-                    pass
-
-        def on_disconnect(e: ft.ControlEvent) -> None:
+    # 先安装关闭处理器。异步入口在初始化期间不会让出事件循环，
+    # 因此即使用户立即关闭窗口，也会等完整初始化结束后再处理关闭事件。
+    async def on_close(e: ft.ControlEvent) -> None:
+        if app_ui is not None:
             app_ui.cleanup()
 
-        page.window.on_event = on_window_event
-        page.on_disconnect = on_disconnect
-    except Exception:
-        pass
+    async def on_disconnect(e: ft.ControlEvent) -> None:
+        if app_ui is not None:
+            app_ui.cleanup()
+
+    page.on_close = on_close
+    page.on_disconnect = on_disconnect
+
+    app_ui = GatewayAppUI(page)
+
+    # 完整控件树已经提交后再显示窗口，避免启动空白和首屏闪烁。
+    page.window.visible = True
+    app_ui._page_update()
 
 
 if __name__ == "__main__":
