@@ -17,8 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import hashlib
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any, Callable
@@ -84,6 +88,104 @@ def resolve_mono_font_family() -> str:
 # ── Linux 原生桌面兼容性与自愈垫片 ──────────────────────────────────────────────
 _LINUX_COMPAT_INITIALIZED = False
 
+_GTK_WINDOW_GUARD_SOURCE = r"""
+#define _GNU_SOURCE
+#include <dlfcn.h>
+
+typedef struct _GtkWindow GtkWindow;
+typedef int (*gtk_window_is_maximized_fn)(GtkWindow *window);
+
+int gtk_window_is_maximized(GtkWindow *window) {
+    if (window == 0) {
+        return 0;
+    }
+
+    gtk_window_is_maximized_fn real_fn =
+        (gtk_window_is_maximized_fn)dlsym(RTLD_NEXT, "gtk_window_is_maximized");
+    return real_fn == 0 ? 0 : real_fn(window);
+}
+"""
+_GTK_WINDOW_GUARD_DIGEST = hashlib.sha256(
+    _GTK_WINDOW_GUARD_SOURCE.encode("utf-8")
+).hexdigest()
+
+
+def _ensure_gtk_window_guard(compat_dir: str) -> None:
+    """生成并注入 GTK 空指针保护垫片，避免 Flet 关闭窗口时访问悬垂对象。"""
+    shim_path = os.path.join(compat_dir, "libmcp_gtk_guard.so")
+    stamp_path = os.path.join(compat_dir, "libmcp_gtk_guard.sha256")
+
+    try:
+        compiler = next(
+            (
+                candidate
+                for candidate in ("cc", "gcc", "clang")
+                if shutil.which(candidate)
+            ),
+            None,
+        )
+        current_digest = ""
+        try:
+            with open(stamp_path, encoding="ascii") as stamp_file:
+                current_digest = stamp_file.read().strip()
+        except OSError:
+            pass
+
+        needs_build = not os.path.isfile(shim_path) or current_digest != _GTK_WINDOW_GUARD_DIGEST
+        if needs_build and compiler:
+            temp_path: str | None = None
+            try:
+                fd, temp_path = tempfile.mkstemp(
+                    prefix=".libmcp_gtk_guard.",
+                    suffix=".so",
+                    dir=compat_dir,
+                )
+                os.close(fd)
+                result = subprocess.run(
+                    [
+                        compiler,
+                        "-shared",
+                        "-fPIC",
+                        "-O2",
+                        "-x",
+                        "c",
+                        "-",
+                        "-o",
+                        temp_path,
+                        "-ldl",
+                    ],
+                    input=_GTK_WINDOW_GUARD_SOURCE,
+                    text=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=8.0,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    return
+                os.replace(temp_path, shim_path)
+                try:
+                    with open(stamp_path, "w", encoding="ascii") as stamp_file:
+                        stamp_file.write(_GTK_WINDOW_GUARD_DIGEST)
+                except OSError:
+                    pass
+            finally:
+                if temp_path:
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
+
+        if not os.path.isfile(shim_path):
+            return
+
+        preload_entries = os.environ.get("LD_PRELOAD", "").split()
+        if shim_path not in preload_entries:
+            os.environ["LD_PRELOAD"] = " ".join([shim_path, *preload_entries])
+    except Exception:
+        # 系统没有编译器或用户目录不可写时，保留 Flet 的默认运行方式。
+        pass
+
 
 def _find_system_libmpv() -> str | None:
     """探测 Linux 系统中实际存在的 libmpv 共享库路径（如 libmpv.so.2 等）。"""
@@ -105,8 +207,6 @@ def _find_system_libmpv() -> str | None:
 
     # 兜底：使用 ldconfig -p 扫描动态链接器缓存
     try:
-        import subprocess
-
         out = subprocess.check_output(
             ["/sbin/ldconfig", "-p"],
             text=True,
@@ -147,7 +247,14 @@ def _ensure_linux_native_compat() -> None:
     if is_wayland_session and os.environ.get("DISPLAY"):
         os.environ["GDK_BACKEND"] = "x11"
 
-    # 1. 检查系统是否已直接拥有 libmpv.so.1
+    # 1. 准备用户级兼容目录，所有垫片均不修改系统目录。
+    compat_dir = os.path.join(os.path.expanduser("~"), ".flet", "compat_libs")
+    try:
+        os.makedirs(compat_dir, exist_ok=True)
+    except OSError:
+        return
+
+    # 2. 检查系统是否已直接拥有 libmpv.so.1
     has_mpv1 = False
     for p in [
         "/usr/lib/x86_64-linux-gnu/libmpv.so.1",
@@ -159,46 +266,39 @@ def _ensure_linux_native_compat() -> None:
             has_mpv1 = True
             break
 
-    if has_mpv1:
-        return
-
-    # 2. 寻找系统中的新版 libmpv (如 libmpv.so.2)
-    real_mpv = _find_system_libmpv()
-    if not real_mpv:
-        return
-
-    # 3. 在用户私有目录创建兼容符号链接
-    compat_dir = os.path.join(os.path.expanduser("~"), ".flet", "compat_libs")
-    try:
-        os.makedirs(compat_dir, exist_ok=True)
-        link_target = os.path.join(compat_dir, "libmpv.so.1")
-        if not os.path.exists(link_target):
+    # 3. 寻找系统中的新版 libmpv (如 libmpv.so.2)，仅在缺少旧名称时建立链接。
+    if not has_mpv1:
+        real_mpv = _find_system_libmpv()
+        if real_mpv:
             try:
-                os.symlink(real_mpv, link_target)
+                link_target = os.path.join(compat_dir, "libmpv.so.1")
+                if not os.path.lexists(link_target):
+                    os.symlink(real_mpv, link_target)
+
+                # 双保险：若 Flet 私有目录已存在，顺便在其中补齐软链接。
+                flet_bin_root = os.path.join(os.path.expanduser("~"), ".flet", "bin")
+                if os.path.isdir(flet_bin_root):
+                    for entry in os.listdir(flet_bin_root):
+                        lib_dir = os.path.join(flet_bin_root, entry, "flet", "lib")
+                        if os.path.isdir(lib_dir):
+                            flet_link = os.path.join(lib_dir, "libmpv.so.1")
+                            if not os.path.lexists(flet_link):
+                                try:
+                                    os.symlink(real_mpv, flet_link)
+                                except OSError:
+                                    pass
+
+                # 注入到 LD_LIBRARY_PATH，使 Flet 原生子进程能够解析兼容名称。
+                curr_ld = os.environ.get("LD_LIBRARY_PATH", "")
+                if compat_dir not in curr_ld.split(os.pathsep):
+                    os.environ["LD_LIBRARY_PATH"] = (
+                        f"{compat_dir}{os.pathsep}{curr_ld}" if curr_ld else compat_dir
+                    )
             except OSError:
                 pass
 
-        # 双保险：若 ~/.flet/bin/flet-*/flet/lib 目录已存在，顺便在此也补齐软链接
-        flet_bin_root = os.path.join(os.path.expanduser("~"), ".flet", "bin")
-        if os.path.isdir(flet_bin_root):
-            for entry in os.listdir(flet_bin_root):
-                lib_dir = os.path.join(flet_bin_root, entry, "flet", "lib")
-                if os.path.isdir(lib_dir):
-                    flet_link = os.path.join(lib_dir, "libmpv.so.1")
-                    if not os.path.exists(flet_link):
-                        try:
-                            os.symlink(real_mpv, flet_link)
-                        except OSError:
-                            pass
-
-        # 4. 注入到 LD_LIBRARY_PATH，使 Flet 原生子进程启动时能够优先解析
-        curr_ld = os.environ.get("LD_LIBRARY_PATH", "")
-        if compat_dir not in curr_ld.split(os.pathsep):
-            os.environ["LD_LIBRARY_PATH"] = (
-                f"{compat_dir}{os.pathsep}{curr_ld}" if curr_ld else compat_dir
-            )
-    except Exception:
-        pass
+    # 4. 保护 Flet 0.28.3 window_manager 插件的 GTK 空指针调用。
+    _ensure_gtk_window_guard(compat_dir)
 
 
 # 模块级首次加载即预初始化垫片环境
@@ -1258,14 +1358,19 @@ class GatewayAppUI:
 
     def _schedule_auto_apply(self) -> None:
         """防抖自动应用。"""
-        if not self.auto_apply_switch.value:
-            return
-        if self._auto_apply_timer:
-            self._auto_apply_timer.cancel()
-        self._auto_apply_timer = threading.Timer(0.8, self._auto_apply_worker)
-        self._auto_apply_timer.start()
+        with self._page_command_lock:
+            if self._closing or not self.auto_apply_switch.value:
+                return
+            if self._auto_apply_timer:
+                self._auto_apply_timer.cancel()
+            self._auto_apply_timer = threading.Timer(0.8, self._auto_apply_worker)
+            self._auto_apply_timer.start()
 
     def _auto_apply_worker(self) -> None:
+        with self._page_command_lock:
+            if self._closing:
+                return
+            self._auto_apply_timer = None
         try:
             self._sync_gateway_from_fields()
             self.manager.write_config_to_disk()
@@ -1834,6 +1939,23 @@ class GatewayAppUI:
                     break
                 # 检查网关健康
                 is_up = self.manager.is_gateway_healthy()
+                state_changed = False
+                state_mtime: int | None = None
+                try:
+                    state_mtime = os.stat(self.manager.state_store.path).st_mtime_ns
+                    state_changed = state_mtime != self._key_state_mtime
+                except OSError:
+                    pass
+
+                # 网络请求必须在页面锁外执行，关闭窗口时不等待 HTTP 超时。
+                if state_changed:
+                    try:
+                        self.manager.fetch_stats()
+                    except Exception:
+                        pass
+
+                if self._closing or self._poll_stop.is_set():
+                    break
                 with self._page_command_lock:
                     if self._closing:
                         break
@@ -1841,15 +1963,10 @@ class GatewayAppUI:
                     self.status_text.value = f"运行中 (端口 {self.manager.runtime_port})" if is_up else "已停止"
 
                     # 检查状态文件变动
-                    try:
-                        mtime = os.stat(self.manager.state_store.path).st_mtime_ns
-                        if mtime != self._key_state_mtime:
-                            self._key_state_mtime = mtime
-                            self.manager.fetch_stats()
-                            self.refresh_keys_list()
-                            self.refresh_service_list()
-                    except Exception:
-                        pass
+                    if state_changed:
+                        self._key_state_mtime = state_mtime
+                        self.refresh_keys_list()
+                        self.refresh_service_list()
 
                     self._page_update()
 
@@ -1893,9 +2010,8 @@ async def main(page: ft.Page) -> None:
     page.window.height = 800
     page.window.min_width = 880
     page.window.min_height = 580
-    # 初始化完成前隐藏原生窗口，避免加载期间出现空白窗口或接受关闭竞态。
+    # 配合 FLET_APP_HIDDEN，在首帧准备完成前保持原生窗口隐藏。
     page.window.wait_until_ready_to_show = True
-    page.window.visible = False
     page.padding = 0
     page.spacing = 0
 
@@ -1907,12 +2023,19 @@ async def main(page: ft.Page) -> None:
         if app_ui is not None:
             app_ui.cleanup()
 
+    async def on_window_event(e: ft.WindowEvent) -> None:
+        """在原生窗口发出关闭事件时尽早停止后台任务。"""
+        if getattr(e, "type", None) == ft.WindowEventType.CLOSE or getattr(e, "data", None) == "close":
+            if app_ui is not None:
+                app_ui.cleanup()
+
     async def on_disconnect(e: ft.ControlEvent) -> None:
         if app_ui is not None:
             app_ui.cleanup()
 
     page.on_close = on_close
     page.on_disconnect = on_disconnect
+    page.window.on_event = on_window_event
 
     app_ui = GatewayAppUI(page)
 
@@ -1924,4 +2047,4 @@ async def main(page: ft.Page) -> None:
 if __name__ == "__main__":
     _ensure_linux_native_compat()
     _configure_windows_dpi()
-    ft.app(target=main)
+    ft.app(target=main, view=ft.AppView.FLET_APP_HIDDEN)
