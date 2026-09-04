@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import ctypes.util
 import hashlib
 import os
 import shutil
@@ -58,6 +59,12 @@ CLR_ERROR = "#ef4444"       # Red 500
 CLR_TEXT = "#f8fafc"        # Slate 50
 CLR_MUTED = "#94a3b8"       # Slate 400
 
+# ── 原生窗口尺寸 ──────────────────────────────────────────────────────────────
+WINDOW_WIDTH = 1200
+WINDOW_HEIGHT = 800
+WINDOW_MIN_WIDTH = 880
+WINDOW_MIN_HEIGHT = 580
+
 # ── 跨平台字体兼容处理 ─────────────────────────────────────────────────────────
 def resolve_ui_font_family() -> str:
     """解析系统首选 UI 界面字体：
@@ -94,6 +101,7 @@ _GTK_WINDOW_GUARD_SOURCE = r"""
 
 typedef struct _GtkWindow GtkWindow;
 typedef int (*gtk_window_is_maximized_fn)(GtkWindow *window);
+typedef void (*gtk_window_resize_fn)(GtkWindow *window, int width, int height);
 
 int gtk_window_is_maximized(GtkWindow *window) {
     if (window == 0) {
@@ -103,6 +111,19 @@ int gtk_window_is_maximized(GtkWindow *window) {
     gtk_window_is_maximized_fn real_fn =
         (gtk_window_is_maximized_fn)dlsym(RTLD_NEXT, "gtk_window_is_maximized");
     return real_fn == 0 ? 0 : real_fn(window);
+}
+
+void gtk_window_resize(GtkWindow *window, int width, int height) {
+    // Flet 0.28.3 会把最大化后的实际尺寸再次传给 gtk_window_resize，GTK 因此会还原窗口。
+    if (window != 0 && gtk_window_is_maximized(window)) {
+        return;
+    }
+
+    gtk_window_resize_fn real_fn =
+        (gtk_window_resize_fn)dlsym(RTLD_NEXT, "gtk_window_resize");
+    if (real_fn != 0) {
+        real_fn(window, width, height);
+    }
 }
 """
 _GTK_WINDOW_GUARD_DIGEST = hashlib.sha256(
@@ -303,6 +324,298 @@ def _ensure_linux_native_compat() -> None:
 
 # 模块级首次加载即预初始化垫片环境
 _ensure_linux_native_compat()
+
+
+# ── Flet 0.28.3 启动窗口兼容处理 ──────────────────────────────────────────────
+class _X11WindowAttributes(ctypes.Structure):
+    """X11 顶层窗口属性的最小 ctypes 映射。"""
+
+    _fields_ = [
+        ("x", ctypes.c_int),
+        ("y", ctypes.c_int),
+        ("width", ctypes.c_int),
+        ("height", ctypes.c_int),
+        ("border_width", ctypes.c_int),
+        ("depth", ctypes.c_int),
+        ("visual", ctypes.c_void_p),
+        ("root", ctypes.c_ulong),
+        ("class_", ctypes.c_int),
+        ("bit_gravity", ctypes.c_int),
+        ("win_gravity", ctypes.c_int),
+        ("backing_store", ctypes.c_int),
+        ("backing_planes", ctypes.c_ulong),
+        ("backing_pixel", ctypes.c_ulong),
+        ("save_under", ctypes.c_int),
+        ("colormap", ctypes.c_ulong),
+        ("map_installed", ctypes.c_int),
+        ("map_state", ctypes.c_int),
+        ("all_event_masks", ctypes.c_long),
+        ("your_event_mask", ctypes.c_long),
+        ("do_not_propagate_mask", ctypes.c_long),
+        ("override_redirect", ctypes.c_int),
+        ("screen", ctypes.c_void_p),
+    ]
+
+
+class _X11ClassHint(ctypes.Structure):
+    """X11 窗口类别字符串的 ctypes 映射。"""
+
+    _fields_ = [("res_name", ctypes.c_void_p), ("res_class", ctypes.c_void_p)]
+
+
+def _x11_string(pointer: int | None) -> str:
+    """读取 X11 分配的 C 字符串，不在此函数中释放内存。"""
+    if not pointer:
+        return ""
+    value = ctypes.cast(pointer, ctypes.c_char_p).value
+    return value.decode(errors="replace") if value else ""
+
+
+def _x11_startup_cloak(native_pid: int) -> None:
+    """暂时隐藏 Flet 默认启动页，等目标尺寸应用后再显示。"""
+    if not sys.platform.startswith("linux") or not os.environ.get("DISPLAY"):
+        return
+    if os.environ.get("GDK_BACKEND", "").lower() == "wayland":
+        return
+
+    library_name = ctypes.util.find_library("X11")
+    if not library_name:
+        return
+
+    try:
+        x11 = ctypes.CDLL(library_name)
+        display_type = ctypes.c_void_p
+        window_type = ctypes.c_ulong
+        atom_type = ctypes.c_ulong
+
+        def bind(name: str, arguments: list[Any], result: Any) -> Any:
+            function = getattr(x11, name)
+            function.argtypes = arguments
+            function.restype = result
+            return function
+
+        x_open_display = bind("XOpenDisplay", [ctypes.c_char_p], display_type)
+        x_close_display = bind("XCloseDisplay", [display_type], ctypes.c_int)
+        x_default_root_window = bind(
+            "XDefaultRootWindow", [display_type], window_type
+        )
+        x_query_tree = bind(
+            "XQueryTree",
+            [
+                display_type,
+                window_type,
+                ctypes.POINTER(window_type),
+                ctypes.POINTER(window_type),
+                ctypes.POINTER(ctypes.POINTER(window_type)),
+                ctypes.POINTER(ctypes.c_uint),
+            ],
+            ctypes.c_int,
+        )
+        x_get_class_hint = bind(
+            "XGetClassHint",
+            [display_type, window_type, ctypes.POINTER(_X11ClassHint)],
+            ctypes.c_int,
+        )
+        x_get_window_attributes = bind(
+            "XGetWindowAttributes",
+            [display_type, window_type, ctypes.POINTER(_X11WindowAttributes)],
+            ctypes.c_int,
+        )
+        x_get_window_property = bind(
+            "XGetWindowProperty",
+            [
+                display_type,
+                window_type,
+                atom_type,
+                ctypes.c_long,
+                ctypes.c_long,
+                ctypes.c_int,
+                atom_type,
+                ctypes.POINTER(atom_type),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_ulong),
+                ctypes.POINTER(ctypes.c_ulong),
+                ctypes.POINTER(ctypes.c_void_p),
+            ],
+            ctypes.c_int,
+        )
+        x_intern_atom = bind(
+            "XInternAtom", [display_type, ctypes.c_char_p, ctypes.c_int], atom_type
+        )
+        x_change_property = bind(
+            "XChangeProperty",
+            [
+                display_type,
+                window_type,
+                atom_type,
+                atom_type,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_int,
+            ],
+            ctypes.c_int,
+        )
+        x_flush = bind("XFlush", [display_type], ctypes.c_int)
+        x_free = bind("XFree", [ctypes.c_void_p], ctypes.c_int)
+
+        display = x_open_display(os.environ["DISPLAY"].encode())
+        if not display:
+            return
+
+        pid_atom = x_intern_atom(display, b"_NET_WM_PID", 0)
+        opacity_atom = x_intern_atom(display, b"_NET_WM_WINDOW_OPACITY", 0)
+        cardinal_atom = x_intern_atom(display, b"CARDINAL", 0)
+        root_window = x_default_root_window(display)
+
+        def get_window_pid(window: int) -> int | None:
+            actual_type = atom_type()
+            actual_format = ctypes.c_int()
+            item_count = ctypes.c_ulong()
+            bytes_after = ctypes.c_ulong()
+            data = ctypes.c_void_p()
+            status = x_get_window_property(
+                display,
+                window_type(window),
+                pid_atom,
+                0,
+                1,
+                0,
+                0,
+                ctypes.byref(actual_type),
+                ctypes.byref(actual_format),
+                ctypes.byref(item_count),
+                ctypes.byref(bytes_after),
+                ctypes.byref(data),
+            )
+            try:
+                if status != 0 or not data.value or item_count.value == 0:
+                    return None
+                return int(ctypes.cast(data, ctypes.POINTER(ctypes.c_uint32))[0])
+            finally:
+                if data.value:
+                    x_free(data)
+
+        def find_window() -> tuple[int, int, int] | None:
+            root_return = window_type()
+            parent_return = window_type()
+            children = ctypes.POINTER(window_type)()
+            child_count = ctypes.c_uint()
+            if not x_query_tree(
+                display,
+                root_window,
+                ctypes.byref(root_return),
+                ctypes.byref(parent_return),
+                ctypes.byref(children),
+                ctypes.byref(child_count),
+            ):
+                return None
+
+            candidate = None
+            try:
+                for index in range(child_count.value):
+                    window = int(children[index])
+                    attributes = _X11WindowAttributes()
+                    if not x_get_window_attributes(
+                        display, window_type(window), ctypes.byref(attributes)
+                    ):
+                        continue
+                    if attributes.width < 100 or attributes.height < 100:
+                        continue
+                    window_pid = get_window_pid(window)
+                    if window_pid == native_pid:
+                        return window, attributes.width, attributes.height
+                    if window_pid is None:
+                        hint = _X11ClassHint()
+                        if x_get_class_hint(
+                            display, window_type(window), ctypes.byref(hint)
+                        ):
+                            resource_class = _x11_string(hint.res_class)
+                            if hint.res_name:
+                                x_free(hint.res_name)
+                            if hint.res_class:
+                                x_free(hint.res_class)
+                            if resource_class.lower() == "flet":
+                                candidate = (window, attributes.width, attributes.height)
+            finally:
+                if bool(children):
+                    x_free(children)
+            return candidate
+
+        def set_opacity(window: int, value: int) -> None:
+            opacity = ctypes.c_uint32(value)
+            x_change_property(
+                display,
+                window_type(window),
+                opacity_atom,
+                cardinal_atom,
+                32,
+                0,
+                ctypes.byref(opacity),
+                1,
+            )
+            x_flush(display)
+
+        deadline = time.monotonic() + 12.0
+        hidden_window: int | None = None
+        try:
+            while time.monotonic() < deadline:
+                window_info = find_window()
+                if window_info is None:
+                    time.sleep(0.03)
+                    continue
+
+                window, width, height = window_info
+                if hidden_window is None:
+                    hidden_window = window
+                    set_opacity(window, 0)
+
+                if window == hidden_window and (width, height) == (
+                    WINDOW_WIDTH,
+                    WINDOW_HEIGHT,
+                ):
+                    set_opacity(window, 0xFFFFFFFF)
+                    return
+
+                time.sleep(0.03)
+        finally:
+            if hidden_window is not None:
+                set_opacity(hidden_window, 0xFFFFFFFF)
+            x_close_display(display)
+    except Exception:
+        # 没有 X11 开发库或窗口管理器不支持该属性时，保留 Flet 默认行为。
+        return
+
+
+def _install_flet_startup_cloak() -> None:
+    """包装 Flet 原生子进程启动，在 Xwayland 下屏蔽默认启动页闪现。"""
+    if not sys.platform.startswith("linux") or not os.environ.get("DISPLAY"):
+        return
+    if os.environ.get("GDK_BACKEND", "").lower() == "wayland":
+        return
+
+    try:
+        import flet_desktop
+
+        original_open = flet_desktop.open_flet_view_async
+        if getattr(original_open, "_mcp_startup_cloak", False):
+            return
+
+        async def open_flet_view_with_cloak(*args: Any, **kwargs: Any) -> Any:
+            result = await original_open(*args, **kwargs)
+            process = result[0]
+            threading.Thread(
+                target=_x11_startup_cloak,
+                args=(process.pid,),
+                daemon=True,
+                name="flet-startup-cloak",
+            ).start()
+            return result
+
+        open_flet_view_with_cloak._mcp_startup_cloak = True
+        flet_desktop.open_flet_view_async = open_flet_view_with_cloak
+    except Exception:
+        return
 
 
 def _synchronized_ui_method(method: Callable[..., Any]) -> Callable[..., Any]:
@@ -2006,12 +2319,15 @@ async def main(page: ft.Page) -> None:
     page.title = APP_TITLE
     page.theme_mode = ft.ThemeMode.DARK
     page.theme = ft.Theme(font_family=resolve_ui_font_family())
-    page.window.width = 1200
-    page.window.height = 800
-    page.window.min_width = 880
-    page.window.min_height = 580
-    # 配合 FLET_APP_HIDDEN，在首帧准备完成前保持原生窗口隐藏。
-    page.window.wait_until_ready_to_show = True
+    page.window.width = WINDOW_WIDTH
+    page.window.height = WINDOW_HEIGHT
+    page.window.min_width = WINDOW_MIN_WIDTH
+    page.window.min_height = WINDOW_MIN_HEIGHT
+    page.window.resizable = True
+    page.window.maximizable = True
+    page.window.minimizable = True
+    # 配合 FLET_APP_HIDDEN，首个页面更新先保持隐藏，避免默认尺寸窗口抢先映射。
+    page.window.visible = False
     page.padding = 0
     page.spacing = 0
 
@@ -2025,7 +2341,10 @@ async def main(page: ft.Page) -> None:
 
     async def on_window_event(e: ft.WindowEvent) -> None:
         """在原生窗口发出关闭事件时尽早停止后台任务。"""
-        if getattr(e, "type", None) == ft.WindowEventType.CLOSE or getattr(e, "data", None) == "close":
+        if (
+            getattr(e, "type", None) == ft.WindowEventType.CLOSE
+            or getattr(e, "data", None) == "close"
+        ):
             if app_ui is not None:
                 app_ui.cleanup()
 
@@ -2039,7 +2358,7 @@ async def main(page: ft.Page) -> None:
 
     app_ui = GatewayAppUI(page)
 
-    # 完整控件树已经提交后再显示窗口，避免启动空白和首屏闪烁。
+    # 控件树、尺寸与最小尺寸均已提交后再显示窗口，避免启动时出现默认尺寸空窗。
     page.window.visible = True
     app_ui._page_update()
 
@@ -2047,4 +2366,5 @@ async def main(page: ft.Page) -> None:
 if __name__ == "__main__":
     _ensure_linux_native_compat()
     _configure_windows_dpi()
+    _install_flet_startup_cloak()
     ft.app(target=main, view=ft.AppView.FLET_APP_HIDDEN)
