@@ -94,6 +94,9 @@ def resolve_mono_font_family() -> str:
 
 # ── Linux 原生桌面兼容性与自愈垫片 ──────────────────────────────────────────────
 _LINUX_COMPAT_INITIALIZED = False
+_FLET_FIRST_PAGE_UPDATE_SENT = threading.Event()
+# 仅等待尺寸稳定 0.25 秒仍可能露出 Flutter 尚未填充的底部黑区。
+_FLET_STARTUP_CLOAK_STABLE_SECONDS = 0.80
 
 _GTK_WINDOW_GUARD_SOURCE = r"""
 #define _GNU_SOURCE
@@ -558,6 +561,7 @@ def _x11_startup_cloak(native_pid: int) -> None:
 
         deadline = time.monotonic() + 12.0
         hidden_window: int | None = None
+        target_size_since: float | None = None
         try:
             while time.monotonic() < deadline:
                 window_info = find_window()
@@ -570,12 +574,22 @@ def _x11_startup_cloak(native_pid: int) -> None:
                     hidden_window = window
                     set_opacity(window, 0)
 
-                if window == hidden_window and (width, height) == (
-                    WINDOW_WIDTH,
-                    WINDOW_HEIGHT,
-                ):
-                    set_opacity(window, 0xFFFFFFFF)
-                    return
+                if window != hidden_window:
+                    hidden_window = window
+                    target_size_since = None
+                    set_opacity(window, 0)
+                elif (width, height) == (WINDOW_WIDTH, WINDOW_HEIGHT):
+                    if target_size_since is None:
+                        target_size_since = time.monotonic()
+                    ready = _FLET_FIRST_PAGE_UPDATE_SENT.is_set()
+                    stable = time.monotonic() - target_size_since
+                    if ready and stable >= _FLET_STARTUP_CLOAK_STABLE_SECONDS:
+                        # 页面首个完整更新已发送，且原生窗口尺寸已稳定，
+                        # 此时再恢复不透明度可避免显示尺寸变化期间的黑区。
+                        set_opacity(window, 0xFFFFFFFF)
+                        return
+                else:
+                    target_size_since = None
 
                 time.sleep(0.03)
         finally:
@@ -2326,7 +2340,8 @@ async def main(page: ft.Page) -> None:
     page.window.resizable = True
     page.window.maximizable = True
     page.window.minimizable = True
-    # 配合 FLET_APP_HIDDEN，首个页面更新先保持隐藏，避免默认尺寸窗口抢先映射。
+    # 为旧版 Linux 客户端的首帧空窗提供应用色背景兜底。
+    page.window.bgcolor = CLR_BG
     page.window.visible = False
     page.padding = 0
     page.spacing = 0
@@ -2358,9 +2373,10 @@ async def main(page: ft.Page) -> None:
 
     app_ui = GatewayAppUI(page)
 
-    # 控件树、尺寸与最小尺寸均已提交后再显示窗口，避免启动时出现默认尺寸空窗。
+    # 控件树、尺寸与最小尺寸均已提交后再显示窗口；Xwayland 遮罩会等待这次更新。
     page.window.visible = True
     app_ui._page_update()
+    _FLET_FIRST_PAGE_UPDATE_SENT.set()
 
 
 if __name__ == "__main__":
