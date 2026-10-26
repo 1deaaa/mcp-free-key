@@ -60,9 +60,10 @@ CLR_TEXT = "#f8fafc"        # Slate 50
 CLR_MUTED = "#94a3b8"       # Slate 400
 
 # ── 原生窗口尺寸 ──────────────────────────────────────────────────────────────
-WINDOW_WIDTH = 1200
+# 顶部设置栏与密钥操作栏均为横向固定布局，1360px 可避免按钮组互相挤压。
+WINDOW_WIDTH = 1360
 WINDOW_HEIGHT = 800
-WINDOW_MIN_WIDTH = 880
+WINDOW_MIN_WIDTH = 1360
 WINDOW_MIN_HEIGHT = 580
 
 # ── 跨平台字体兼容处理 ─────────────────────────────────────────────────────────
@@ -653,6 +654,7 @@ class GatewayAppUI:
         self.selected_keys: set[str] = set()
         self.search_filter: str = ""
         self.status_filter: str = "all"  # "all", "normal", "disabled"
+        self._visible_key_order: list[str] = []
 
         self._auto_apply_timer: threading.Timer | None = None
         self._key_state_mtime: int | None = None
@@ -820,11 +822,12 @@ class GatewayAppUI:
             on_change=self.handle_select_all_toggle,
         )
 
-        # 密钥列表容器
-        self.keys_listview = ft.ListView(
-            spacing=6,
+        # 密钥列表容器：桌面端显示原生拖拽手柄，移动端支持长按拖动。
+        self.keys_listview = ft.ReorderableListView(
             padding=ft.padding.all(6),
             expand=True,
+            show_default_drag_handles=True,
+            on_reorder=self.handle_keys_reorder,
         )
 
         # 服务参数配置控件
@@ -1158,6 +1161,24 @@ class GatewayAppUI:
                 ),
                 ft.Row(
                     controls=[
+                        ft.OutlinedButton(
+                            "一键排序",
+                            icon=ft.Icons.SORT_ROUNDED,
+                            height=32,
+                            style=ft.ButtonStyle(
+                                padding=ft.padding.symmetric(horizontal=10),
+                            ),
+                            on_click=self.handle_sort_keys_by_monthly_success,
+                        ),
+                        ft.OutlinedButton(
+                            "立刻刷新",
+                            icon=ft.Icons.REFRESH_ROUNDED,
+                            height=32,
+                            style=ft.ButtonStyle(
+                                padding=ft.padding.symmetric(horizontal=10),
+                            ),
+                            on_click=self.handle_refresh_now,
+                        ),
                         ft.ElevatedButton(
                             "导入密钥",
                             icon=ft.Icons.ADD_ROUNDED,
@@ -1514,6 +1535,7 @@ class GatewayAppUI:
         """根据搜索与状态过滤器渲染当前服务的密钥列表。"""
         self.keys_listview.controls.clear()
         if not (0 <= self.current_service_index < len(self.manager.config.services)):
+            self._visible_key_order = []
             return
 
         items = self.manager.get_key_display_items(self.current_service_index)
@@ -1543,6 +1565,7 @@ class GatewayAppUI:
             filtered_items.append(it)
 
         if not filtered_items:
+            self._visible_key_order = []
             self.keys_listview.controls.append(
                 ft.Container(
                     content=ft.Text("暂无匹配的密钥记录", color=CLR_MUTED, size=12),
@@ -1551,6 +1574,8 @@ class GatewayAppUI:
                 )
             )
             return
+
+        self._visible_key_order = [item.key for item in filtered_items]
 
         for it in filtered_items:
             k = it.key
@@ -1639,10 +1664,12 @@ class GatewayAppUI:
 
             item_card = ft.Container(
                 content=card_row,
-                padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                # 为桌面端原生拖拽手柄预留右侧空间，避免遮挡操作按钮。
+                padding=ft.padding.only(left=8, right=40, top=4, bottom=4),
                 bgcolor=CLR_CARD,
                 border=ft.border.all(1, CLR_BORDER),
                 border_radius=8,
+                margin=ft.margin.only(bottom=6),
             )
             self.keys_listview.controls.append(item_card)
 
@@ -1971,6 +1998,105 @@ class GatewayAppUI:
         self.status_filter = self.filter_dropdown.value
         self.refresh_keys_list()
         self._page_update()
+
+    def handle_keys_reorder(self, e=None) -> None:
+        """处理密钥列表拖动排序，并合并回完整密钥池顺序。"""
+        old_index = getattr(e, "old_index", None)
+        new_index = getattr(e, "new_index", None)
+        if old_index is None or new_index is None:
+            return
+        if not (0 <= self.current_service_index < len(self.manager.config.services)):
+            return
+
+        visible_order = list(self._visible_key_order)
+        if not (0 <= old_index < len(visible_order)):
+            return
+
+        moved_key = visible_order.pop(old_index)
+        new_index = max(0, min(new_index, len(visible_order)))
+        visible_order.insert(new_index, moved_key)
+
+        svc = self.manager.config.services[self.current_service_index]
+        visible_set = set(self._visible_key_order)
+        visible_iter = iter(visible_order)
+        merged_order = [
+            next(visible_iter) if key in visible_set else key
+            for key in svc.keys
+        ]
+        self.manager.reorder_service_keys(self.current_service_index, merged_order)
+        self.refresh_keys_list()
+        self.refresh_service_list()
+        self._page_update()
+        self._persist_key_order_and_reload()
+        self.show_snack("密钥轮询顺序已更新", CLR_SUCCESS)
+        self.log("🔀 已通过拖动更新密钥轮询顺序")
+
+    def _persist_key_order_and_reload(self) -> None:
+        """保存密钥顺序，并在网关运行时请求热重载。"""
+        try:
+            self.manager.write_config_to_disk()
+        except Exception as exc:
+            self.log(f"⚠️ 密钥顺序保存失败: {exc}")
+            return
+
+        def _reload_worker() -> None:
+            try:
+                if not self.manager.is_gateway_healthy(self.manager.runtime_port):
+                    self.log("ℹ️ 密钥顺序已保存，网关未运行，启动后生效")
+                    return
+                ok, error = self.manager.request_gateway_reload(
+                    self.manager.runtime_port,
+                    self.manager.runtime_access_key,
+                )
+                if ok:
+                    self.manager.stats_cache_time = 0.0
+                    self.log("✅ 密钥顺序已热重载到运行中的网关")
+                else:
+                    self.log(f"⚠️ 密钥顺序已保存，但网关热重载失败: {error or '未知错误'}")
+            except Exception as exc:
+                self.log(f"⚠️ 密钥顺序热重载异常: {exc}")
+
+        threading.Thread(target=_reload_worker, daemon=True).start()
+
+    def handle_sort_keys_by_monthly_success(self, e=None) -> None:
+        """按本月成功请求次数从小到大排序当前服务的密钥。"""
+        if not (0 <= self.current_service_index < len(self.manager.config.services)):
+            self.show_snack("请先选择一个有效服务", CLR_WARN)
+            return
+
+        self.manager.fetch_stats(force=True)
+        ordered = self.manager.sort_service_keys_by_monthly_success(self.current_service_index)
+        if not ordered:
+            self.show_snack("当前服务没有可排序的密钥", CLR_WARN)
+            return
+
+        self.refresh_keys_list()
+        self.refresh_service_list()
+        self._page_update()
+        self._persist_key_order_and_reload()
+        self.show_snack("已按本月成功请求次数从小到大排序", CLR_SUCCESS)
+        self.log("📊 已按本月成功请求次数升序调整密钥轮询顺序")
+
+    def handle_refresh_now(self, e=None) -> None:
+        """立即刷新网关统计、本地状态与当前密钥列表。"""
+        self.manager.fetch_stats(force=True)
+        try:
+            self._key_state_mtime = os.stat(self.manager.state_store.path).st_mtime_ns
+        except OSError:
+            self._key_state_mtime = None
+
+        is_up = self.manager.is_gateway_healthy()
+        self.status_indicator.bgcolor = CLR_SUCCESS if is_up else ft.Colors.GREY_500
+        self.status_text.value = (
+            f"运行中 (端口 {self.manager.runtime_port})" if is_up else "已停止"
+        )
+        self.status_text.color = CLR_SUCCESS if is_up else CLR_MUTED
+        self.refresh_keys_list()
+        self.refresh_service_list()
+        self._refresh_mcp_config()
+        self._page_update()
+        self.show_snack("密钥状态已立即刷新", CLR_SUCCESS)
+        self.log("🔄 已立即刷新网关统计与密钥状态")
 
     def handle_import_keys(self, e=None) -> None:
         """打开批量导入密钥弹窗。"""
