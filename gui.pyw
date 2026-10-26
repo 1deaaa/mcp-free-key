@@ -1856,7 +1856,7 @@ class GatewayAppUI:
                     failure_patterns=patterns,
                 )
                 self._page_close(dlg)
-                self.manager.write_config_to_disk()
+                self._save_config_and_hot_reload("✅ 新服务已热重载到运行中的网关", "服务新增")
                 new_index = len(self.manager.config.services) - 1
                 self.load_service(new_index)
                 self.refresh_service_list()
@@ -1901,7 +1901,7 @@ class GatewayAppUI:
         def do_delete(ev):
             self._page_close(dlg)
             self.manager.delete_service(self.current_service_index)
-            self.manager.write_config_to_disk()
+            self._save_config_and_hot_reload("✅ 服务删除已热重载到运行中的网关", "服务删除")
             self.current_service_index = 0 if self.manager.config.services else -1
             if self.current_service_index >= 0:
                 self.load_service(self.current_service_index)
@@ -2031,18 +2031,22 @@ class GatewayAppUI:
         self.show_snack("密钥轮询顺序已更新", CLR_SUCCESS)
         self.log("🔀 已通过拖动更新密钥轮询顺序")
 
-    def _persist_key_order_and_reload(self) -> None:
-        """保存密钥顺序，并在网关运行时请求热重载。"""
+    def _save_config_and_hot_reload(self, ok_log: str, fail_prefix: str = "配置") -> None:
+        """保存配置并后台热重载到运行中的网关（密钥增删改后立刻生效）。
+
+        所有只写盘的路径都必须经由此方法，否则运行中的网关仍使用旧密钥池，
+        聚合目录会因 ``_active_services`` 过滤掉空密钥服务而缺失对应工具。
+        """
         try:
             self.manager.write_config_to_disk()
         except Exception as exc:
-            self.log(f"⚠️ 密钥顺序保存失败: {exc}")
+            self.log(f"⚠️ {fail_prefix}保存失败: {exc}")
             return
 
         def _reload_worker() -> None:
             try:
                 if not self.manager.is_gateway_healthy(self.manager.runtime_port):
-                    self.log("ℹ️ 密钥顺序已保存，网关未运行，启动后生效")
+                    self.log(f"ℹ️ {fail_prefix}已保存，网关未运行，启动后生效")
                     return
                 ok, error = self.manager.request_gateway_reload(
                     self.manager.runtime_port,
@@ -2050,13 +2054,17 @@ class GatewayAppUI:
                 )
                 if ok:
                     self.manager.stats_cache_time = 0.0
-                    self.log("✅ 密钥顺序已热重载到运行中的网关")
+                    self.log(ok_log)
                 else:
-                    self.log(f"⚠️ 密钥顺序已保存，但网关热重载失败: {error or '未知错误'}")
+                    self.log(f"⚠️ {fail_prefix}已保存，但网关热重载失败: {error or '未知错误'}")
             except Exception as exc:
-                self.log(f"⚠️ 密钥顺序热重载异常: {exc}")
+                self.log(f"⚠️ {fail_prefix}热重载异常: {exc}")
 
         threading.Thread(target=_reload_worker, daemon=True).start()
+
+    def _persist_key_order_and_reload(self) -> None:
+        """保存密钥顺序，并在网关运行时请求热重载。"""
+        self._save_config_and_hot_reload("✅ 密钥顺序已热重载到运行中的网关", "密钥顺序")
 
     def handle_sort_keys_by_monthly_success(self, e=None) -> None:
         """按本月成功请求次数从小到大排序当前服务的密钥。"""
@@ -2118,7 +2126,7 @@ class GatewayAppUI:
             raw = text_input.value or ""
             new_count, all_keys = self.manager.import_keys(self.current_service_index, raw)
             self._page_close(dlg)
-            self.manager.write_config_to_disk()
+            self._save_config_and_hot_reload("✅ 新增密钥已热重载到运行中的网关", "密钥导入")
             self.refresh_keys_list()
             self.refresh_service_list()
             self._page_update()
@@ -2318,7 +2326,7 @@ class GatewayAppUI:
             keys = list(self.selected_keys)
             count = self.manager.delete_selected_keys(self.current_service_index, keys)
             self.selected_keys.clear()
-            self.manager.write_config_to_disk()
+            self._save_config_and_hot_reload("✅ 密钥删除已热重载到运行中的网关", "密钥删除")
             self.refresh_keys_list()
             self.refresh_service_list()
             self._page_update()
@@ -2342,7 +2350,7 @@ class GatewayAppUI:
             self._page_close(dlg)
             self.manager.delete_selected_keys(self.current_service_index, [key])
             self.selected_keys.discard(key)
-            self.manager.write_config_to_disk()
+            self._save_config_and_hot_reload("✅ 密钥删除已热重载到运行中的网关", "密钥删除")
             self.refresh_keys_list()
             self.refresh_service_list()
             self._page_update()

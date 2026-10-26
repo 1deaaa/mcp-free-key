@@ -6,7 +6,7 @@ gateway:
   max_failover_retries: 3
   upstream_timeout_seconds: 120
   routing_mode: primary_backup
-  aggregate_enabled: false
+  aggregate_enabled: true
 services:
 - name: context7
   upstream_url: https://mcp.context7.com/mcp
@@ -21,6 +21,7 @@ services:
   - quota
   - unauthorized
   - invalid api key
+  provider: ''
 - name: tavily
   upstream_url: https://mcp.tavily.com/mcp/
   enabled: true
@@ -40,11 +41,8 @@ services:
   - exceeds the pay-as-you-go limit
   - upgrade your plan
   - usage limit
-# 原生服务：serper.dev 无官方托管 MCP 端点，网关内置 MCP 适配层，
-# 把 tools/call 翻译为 serper REST（X-API-KEY 注入）。
-# 客户端访问：http://127.0.0.1:10240/serper（一键聚合时为 /mcp 下的 serper_* 工具）。
+  provider: ''
 - name: serper
-  provider: serper
   upstream_url: native://serper
   enabled: true
   key_auth:
@@ -64,3 +62,4 @@ services:
   - out of credits
   - rate limit
   - too many requests
+  provider: serper
