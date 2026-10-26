@@ -51,6 +51,23 @@ DEFAULT_FAILURE_PATTERNS: dict[str, tuple[str, ...]] = {
         "upgrade your plan",
         "usage limit",
     ),
+    # Serper REST 错误语义（实测）：
+    # - 密钥无效/缺失 → HTTP 403 {"message":"Unauthorized.","statusCode":403}；
+    # - 积分耗尽 → HTTP 403 且 message 提示 credits 不足；
+    # - 触发 5 次/秒限速 → HTTP 429。
+    "serper": (
+        "401",
+        "403",
+        "429",
+        "unauthorized",
+        "invalid api key",
+        "not enough credits",
+        "insufficient credits",
+        "credits exhausted",
+        "out of credits",
+        "rate limit",
+        "too many requests",
+    ),
 }
 
 
@@ -79,17 +96,18 @@ class ServiceConfig:
     """单个被聚合的 MCP 服务配置。"""
 
     name: str                                   # 服务名，也是路由路径，如 context7
-    upstream_url: str                           # 上游 remote URL
+    upstream_url: str                           # 上游 remote URL；原生服务用 native:// 前缀自动生成
     enabled: bool = True                        # 是否启用
     key_auth: KeyAuthConfig = field(default_factory=KeyAuthConfig)
     keys: list[str] = field(default_factory=list)            # 上游密钥池
     failure_patterns: list[str] = field(default_factory=list)  # 服务专属失败特征（小写匹配）
+    provider: str = ""                          # 原生服务提供方名，为空时回退为 name
 
     def validate(self) -> None:
         """校验服务配置。"""
         if not self.name:
             raise ValueError("服务缺少 name 字段")
-        if not self.upstream_url:
+        if not self.upstream_url and not self.is_native:
             raise ValueError(f"服务 [{self.name}] 缺少 upstream_url 字段")
         self.key_auth.validate(self.name)
 
@@ -97,9 +115,28 @@ class ServiceConfig:
         """基础校验：不检查密钥池是否为空（供 GUI 编辑时使用）。"""
         if not self.name:
             raise ValueError("服务缺少 name 字段")
-        if not self.upstream_url:
+        if not self.upstream_url and not self.is_native:
             raise ValueError(f"服务 [{self.name}] 缺少 upstream_url 字段")
         self.key_auth.validate(self.name)
+
+    @property
+    def resolved_provider(self) -> str:
+        """解析生效的提供方名称（显式 provider 优先，否则回退为服务名）。"""
+        return (self.provider or self.name).strip().lower()
+
+    @property
+    def is_native(self) -> bool:
+        """是否为网关内置的原生 MCP 服务。"""
+        from .native import is_native_url  # 延迟导入避免循环
+
+        if is_native_url(self.upstream_url):
+            return True
+        if self.upstream_url:
+            return False
+        # 允许原生服务省略 upstream_url（保存时将自动回填为 native:// 前缀）
+        from .providers import get_native_provider  # 延迟导入避免循环
+
+        return get_native_provider(self.resolved_provider) is not None
 
     @property
     def normalized_failure_patterns(self) -> list[str]:
@@ -118,6 +155,7 @@ class GatewayConfig:
     max_failover_retries: int = DEFAULT_MAX_FAILOVER_RETRIES
     upstream_timeout_seconds: int = 120
     routing_mode: str = ROUTING_MODE_ROUND_ROBIN
+    aggregate_enabled: bool = False  # 一键聚合开关：开启后 /mcp 暴露全部服务
 
     def validate(self) -> None:
         """校验网关配置。"""
@@ -177,14 +215,31 @@ def _parse_service(raw: dict[str, Any]) -> ServiceConfig:
     raw_patterns = raw.get("failure_patterns")
     if raw_patterns is None:
         raw_patterns = DEFAULT_FAILURE_PATTERNS.get(str(raw.get("name", "")), ())
-    return ServiceConfig(
-        name=str(raw.get("name", "")),
-        upstream_url=str(raw.get("upstream_url", "")),
+    provider = str(raw.get("provider", "") or "").strip().lower()
+    name = str(raw.get("name", ""))
+    upstream_url = str(raw.get("upstream_url", ""))
+    if not upstream_url and provider:
+        # 原生服务可省略 upstream_url，自动回填为 native:// 标记。
+        from .native import NATIVE_URL_PREFIX
+        from .providers import get_native_provider
+
+        if get_native_provider(provider or name.lower()) is not None:
+            upstream_url = f"{NATIVE_URL_PREFIX}{provider or name.lower()}"
+    svc = ServiceConfig(
+        name=name,
+        upstream_url=upstream_url,
         enabled=bool(raw.get("enabled", True)),
         key_auth=_parse_key_auth(raw.get("key_auth")),
         keys=list(raw.get("keys", []) or []),
         failure_patterns=[str(item) for item in (raw_patterns or [])],
+        provider=provider,
     )
+    if not svc.failure_patterns and not raw.get("failure_patterns"):
+        # provider 显式指定时也允许从默认表补齐失败特征。
+        svc.failure_patterns = [
+            str(item) for item in DEFAULT_FAILURE_PATTERNS.get(svc.resolved_provider, ())
+        ]
+    return svc
 
 
 def _load_env_keys() -> dict[str, list[str]]:
@@ -274,6 +329,12 @@ def load_config(path: str | None = None, *, strict: bool = True) -> AppConfig:
         vals = env_keys.get(key, [])
         return int(vals[0]) if vals else default
 
+    def _env_bool(key: str, default: bool) -> bool:
+        vals = env_keys.get(key, [])
+        if not vals:
+            return default
+        return str(vals[0]).strip().lower() in ("1", "true", "yes", "on")
+
     gateway = GatewayConfig(
         port=_env_int("GATEWAY_PORT", int(gw_raw.get("port", 8080))),
         access_keys=gw_keys,
@@ -290,6 +351,10 @@ def load_config(path: str | None = None, *, strict: bool = True) -> AppConfig:
         routing_mode=str(
             env_keys.get("GATEWAY_ROUTING_MODE", [gw_raw.get("routing_mode", ROUTING_MODE_ROUND_ROBIN)])[0]
         ).strip() or ROUTING_MODE_ROUND_ROBIN,
+        aggregate_enabled=_env_bool(
+            "GATEWAY_AGGREGATE_ENABLED",
+            bool(gw_raw.get("aggregate_enabled", False)),
+        ),
     )
 
     services = []
@@ -325,6 +390,7 @@ def dump_config(config: AppConfig, path: str | None = None) -> None:
         "GATEWAY_MAX_FAILOVER_RETRIES": config.gateway.max_failover_retries,
         "GATEWAY_UPSTREAM_TIMEOUT_SECONDS": config.gateway.upstream_timeout_seconds,
         "GATEWAY_ROUTING_MODE": config.gateway.routing_mode,
+        "GATEWAY_AGGREGATE_ENABLED": int(bool(config.gateway.aggregate_enabled)),
     }
     _save_env_keys(config.gateway.access_keys, services_keys, gateway_settings)
     

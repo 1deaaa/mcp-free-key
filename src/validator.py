@@ -24,7 +24,8 @@ import httpx
 
 from .config import ServiceConfig
 from .failure import detect_failure
-from .providers import ProbeSpec, get_provider
+from .native import NativeClient, is_native_url
+from .providers import ProbeSpec, get_native_provider, get_provider
 from .sse import parse_json_messages
 
 
@@ -102,6 +103,8 @@ async def validate_key(
     loop = asyncio.get_event_loop()
     start = loop.time()
     url, headers = _build_request_target(service, key)
+    native = is_native_url(url) or get_native_provider(service.resolved_provider) is not None
+    native_confirmed = is_native_url(url)
 
     init_body = {
         "jsonrpc": "2.0",
@@ -117,7 +120,122 @@ async def validate_key(
 
     patterns = service.normalized_failure_patterns
 
+    native_client: NativeClient | None = None
+    if native:
+        from .providers import _PROVIDERS  # noqa: PLC0415 - 复用注册表构造进程内客户端
+
+        native_client = NativeClient(
+            {k: v for k, v in _PROVIDERS.items() if getattr(v, "native", False)}
+        )
+        if native_confirmed:
+            headers.setdefault("Content-Type", "application/json")
+            headers.setdefault("Accept", "application/json, text/event-stream")
+            # 原生服务通过进程内客户端发起校验，不依赖网关进程是否运行。
+
+        async def _post(target: str, payload: dict, sess: dict[str, str]) -> httpx.Response:
+            return await native_client.request(
+                "POST", target, headers={**headers, **sess}, content=json.dumps(payload).encode("utf-8")
+            )
+    else:
+        async def _post(target: str, payload: dict, sess: dict[str, str]) -> httpx.Response:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                return await client.post(target, headers={**headers, **sess}, json=payload)
+
     try:
+        if native_client is not None:
+            # 1) initialize
+            r_init = await _post(url, init_body, {})
+            if r_init.status_code in (401, 402, 403):
+                await native_client.aclose()
+                return _result(
+                    key,
+                    STATUS_INVALID,
+                    f"initialize 返回 {r_init.status_code}（鉴权失败）",
+                    loop,
+                    start,
+                    raw_error=r_init.text,
+                    raw_status_code=r_init.status_code,
+                )
+
+            fr_init = detect_failure(r_init.status_code, r_init.headers.get("content-type"), r_init.text, patterns)
+            if fr_init.is_failure:
+                await native_client.aclose()
+                return _result(
+                    key,
+                    STATUS_INVALID,
+                    f"initialize 阶段失败：{fr_init.reason}",
+                    loop,
+                    start,
+                    raw_error=r_init.text,
+                    raw_status_code=r_init.status_code,
+                )
+
+            # 取上游会话 id（有状态上游需要）
+            sess_headers: dict[str, str] = {}
+
+            if not deep:
+                await native_client.aclose()
+                return _result(key, STATUS_VALID, "鉴权通过（未做额度校验）", loop, start)
+
+            # 2) 深度校验：直接发起真实探针 tools/call 以检测额度
+            provider = get_provider(service.name)
+            probe = probe or (provider.get_probe() if provider is not None else None)
+            if probe is None:
+                tools_body = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+                r_tools = await _post(url, tools_body, sess_headers)
+                fr_tools = detect_failure(r_tools.status_code, r_tools.headers.get("content-type"), r_tools.text, patterns)
+                await native_client.aclose()
+                if fr_tools.is_failure:
+                    return _result(
+                        key,
+                        STATUS_INVALID,
+                        f"tools/list 失败：{fr_tools.reason}",
+                        loop,
+                        start,
+                        raw_error=r_tools.text,
+                        raw_status_code=r_tools.status_code,
+                    )
+                return _result(key, STATUS_VALID, "鉴权通过（无探针，未做额度校验）", loop, start)
+
+            call_body = {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": probe.tool, "arguments": probe.arguments},
+            }
+            r_call = await _post(url, call_body, sess_headers)
+            fr_call = detect_failure(r_call.status_code, r_call.headers.get("content-type"), r_call.text, patterns)
+            await native_client.aclose()
+            if fr_call.is_failure:
+                if r_call.status_code in (401, 403):
+                    status, label = STATUS_INVALID, "鉴权失败"
+                else:
+                    status, label = STATUS_QUOTA, "额度耗尽/受限"
+                return _result(
+                    key,
+                    status,
+                    f"{label}：{fr_call.reason}",
+                    loop,
+                    start,
+                    raw_error=r_call.text,
+                    raw_status_code=r_call.status_code,
+                )
+
+            # 深度检查：即便没命中 failure_patterns，也扫一遍 content 文本中的常见超限提示
+            extra = _scan_tool_result_for_quota(r_call.text, r_call.headers.get("content-type"))
+            if extra:
+                return _result(
+                    key,
+                    STATUS_QUOTA,
+                    f"额度耗尽/受限：{extra}",
+                    loop,
+                    start,
+                    raw_error=r_call.text,
+                    raw_status_code=r_call.status_code,
+                )
+
+            return _result(key, STATUS_VALID, "有效且有额度", loop, start)
+
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             # 1) initialize
             r_init = await client.post(url, headers=headers, json=init_body)
@@ -189,10 +307,14 @@ async def validate_key(
             r_call = await client.post(url, headers=sess_headers, json=call_body)
             fr_call = detect_failure(r_call.status_code, r_call.headers.get("content-type"), r_call.text, patterns)
             if fr_call.is_failure:
+                if r_call.status_code in (401, 403):
+                    status, label = STATUS_INVALID, "鉴权失败"
+                else:
+                    status, label = STATUS_QUOTA, "额度耗尽/受限"
                 return _result(
                     key,
-                    STATUS_QUOTA,
-                    f"额度耗尽/受限：{fr_call.reason}",
+                    status,
+                    f"{label}：{fr_call.reason}",
                     loop,
                     start,
                     raw_error=r_call.text,

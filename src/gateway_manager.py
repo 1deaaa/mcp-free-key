@@ -138,6 +138,7 @@ class GatewayManager:
         retries: int,
         timeout: int,
         routing_mode: str,
+        aggregate_enabled: bool | None = None,
     ) -> None:
         """更新网关全局配置。"""
         mode = ROUTING_LABEL_MODES.get(routing_mode, routing_mode)
@@ -149,6 +150,11 @@ class GatewayManager:
             max_failover_retries=retries,
             upstream_timeout_seconds=timeout,
             routing_mode=mode,
+            aggregate_enabled=(
+                self.config.gateway.aggregate_enabled
+                if aggregate_enabled is None
+                else bool(aggregate_enabled)
+            ),
         )
         self.config.gateway.validate()
 
@@ -162,12 +168,14 @@ class GatewayManager:
         key_type: str,
         key_param: str,
         failure_patterns: list[str],
+        provider: str = "",
     ) -> ServiceConfig:
         """更新指定服务的配置（保留其原有密钥列表）。"""
         if not (0 <= service_index < len(self.config.services)):
             raise IndexError(f"无效的服务索引: {service_index}")
 
         current_keys = self.config.services[service_index].keys
+        current_provider = self.config.services[service_index].provider
         updated_svc = ServiceConfig(
             name=name.strip(),
             upstream_url=upstream_url.strip(),
@@ -179,6 +187,7 @@ class GatewayManager:
             ),
             keys=current_keys,
             failure_patterns=dedupe_keep_order(failure_patterns),
+            provider=(provider or current_provider).strip().lower(),
         )
         updated_svc.validate_basic()
         self.config.services[service_index] = updated_svc
@@ -491,6 +500,38 @@ class GatewayManager:
         self.stats_cache_time = 0.0
         return count
 
+    def reorder_service_keys(self, service_index: int, ordered_keys: list[str]) -> list[str]:
+        """按给定顺序重排服务密钥，返回实际生效的完整顺序。"""
+        if not (0 <= service_index < len(self.config.services)):
+            raise IndexError(f"无效的服务索引: {service_index}")
+
+        svc = self.config.services[service_index]
+        current_keys = list(svc.keys)
+        current_set = set(current_keys)
+        requested = dedupe_keep_order([key for key in ordered_keys if key in current_set])
+        requested_set = set(requested)
+        requested.extend(key for key in current_keys if key not in requested_set)
+
+        svc.keys = requested
+        self.stats_cache_time = 0.0
+        return list(svc.keys)
+
+    def sort_service_keys_by_monthly_success(self, service_index: int) -> list[str]:
+        """按本月成功请求次数从小到大稳定排序服务密钥。"""
+        if not (0 <= service_index < len(self.config.services)):
+            raise IndexError(f"无效的服务索引: {service_index}")
+
+        svc = self.config.services[service_index]
+        monthly_counts = {
+            item.key: item.monthly_success_count
+            for item in self.get_key_display_items(service_index)
+        }
+        indexed_keys = list(enumerate(svc.keys))
+        indexed_keys.sort(key=lambda pair: (monthly_counts.get(pair[1], 0), pair[0]))
+        svc.keys = [key for _, key in indexed_keys]
+        self.stats_cache_time = 0.0
+        return list(svc.keys)
+
     def restore_key_available(self, service_name: str, key: str) -> None:
         """将单把密钥从冷却/禁用中恢复。"""
         self.state_store.reset_key(service_name, key)
@@ -569,9 +610,9 @@ class GatewayManager:
         return reports
 
     # ── 状态展示与统计 ──────────────────────────────────────────────────────────
-    def fetch_stats(self) -> dict[str, Any]:
+    def fetch_stats(self, force: bool = False) -> dict[str, Any]:
         """从网关拉取最新统计数据。"""
-        if time.time() - self.stats_cache_time <= 2.5:
+        if not force and time.time() - self.stats_cache_time <= 2.5:
             return self.stats_cache
         try:
             with httpx.Client(timeout=1.0) as client:
@@ -648,6 +689,8 @@ class GatewayManager:
             quota_info = None
             if usage and usage.ok and usage.key_remaining is not None and usage.key_limit is not None:
                 quota_info = f"余 {usage.key_remaining}/{usage.key_limit}"
+            elif usage and usage.ok and usage.balance is not None:
+                quota_info = f"余 {usage.balance} 积分"
 
             # 脱敏展示
             if len(key) <= 24:
@@ -724,6 +767,11 @@ class GatewayManager:
             return f"❌ {key} | {snapshot.detail}"
 
         parts = [f"📊 {key}"]
+        if snapshot.balance is not None:
+            plan = f"剩余积分 {snapshot.balance}"
+            if snapshot.rate_limit is not None:
+                plan += f"（限速 {snapshot.rate_limit}/秒）"
+            parts.append(plan)
         if (
             snapshot.key_remaining is not None
             and snapshot.key_limit is not None
@@ -752,15 +800,19 @@ class GatewayManager:
         service_name: str,
         client_type: str = "claude",
     ) -> str:
-        """生成支持 Claude Desktop / Cursor / Cline 的 MCP 配置 JSON。"""
+        """生成支持 Claude Desktop / Cursor / Cline 的 MCP 配置 JSON。
+
+        service_name 为空或 "aggregate" 时生成一键聚合端点 (/mcp) 配置。
+        """
         port = self.config.gateway.port
-        gw_key = self.runtime_access_key or "YOUR_GATEWAY_ACCESS_KEY"
+        gw_key = self.runtime_access_key or "YOUR_GATEWAY_ACCESS_KEYS"
+        target = "mcp" if not service_name or service_name == "aggregate" else f"{service_name}/mcp"
 
         if client_type.lower() == "cursor":
             cfg = {
                 "mcpServers": {
-                    f"mcp-{service_name}": {
-                        "url": f"http://127.0.0.1:{port}/{service_name}/mcp",
+                    f"mcp-{service_name or 'all'}": {
+                        "url": f"http://127.0.0.1:{port}/{target}",
                         "headers": {"Authorization": gw_key},
                     }
                 }
@@ -768,9 +820,9 @@ class GatewayManager:
         else:  # Claude Desktop / Cline / 通用 streamable-http
             cfg = {
                 "mcpServers": {
-                    f"gateway-{service_name}": {
+                    f"gateway-{service_name or 'all'}": {
                         "type": "streamable-http",
-                        "url": f"http://127.0.0.1:{port}/{service_name}/mcp",
+                        "url": f"http://127.0.0.1:{port}/{target}",
                         "headers": {"Authorization": gw_key},
                     }
                 }

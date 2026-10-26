@@ -27,6 +27,7 @@ from .config import AppConfig, ServiceConfig
 from .failure import detect_failure
 from .keypool import KeyPool
 from .key_state import KeyStateStore
+from .native import NativeClient, is_native_url
 from .sessions import SessionStore
 
 logger = logging.getLogger("mcp_gateway.proxy")
@@ -84,16 +85,23 @@ class ProxyEngine:
         client: httpx.AsyncClient,
         *,
         state_store: KeyStateStore | None = None,
+        native_providers: dict[str, Any] | None = None,
     ) -> None:
         """初始化。
 
         Args:
             config: 应用配置。
             client: 注入的 httpx 异步客户端（生产用真实，测试用 MockTransport）。
+            native_providers: 原生 MCP 提供方注册表（无远端上游的服务走进程内转发）。
         """
         self._config = config
         self._client = client
         self._state_store = state_store
+        if native_providers is None:
+            from .providers import _PROVIDERS  # noqa: PLC0415 - 延迟导入避免循环
+
+            native_providers = {k: v for k, v in _PROVIDERS.items() if getattr(v, "native", False)}
+        self._native_client = NativeClient(native_providers)
         self._runtimes: dict[str, ServiceRuntime] = {}
         for svc in config.services:
             pool = None
@@ -265,13 +273,23 @@ class ProxyEngine:
             req_headers["Mcp-Session-Id"] = client_session_id
 
         try:
-            upstream = await self._client.request(
-                method,
-                url,
-                headers=req_headers,
-                content=body,
-                timeout=float(self._config.gateway.upstream_timeout_seconds),
-            )
+            timeout = float(self._config.gateway.upstream_timeout_seconds)
+            if is_native_url(url):
+                upstream = await self._native_client.request(
+                    method,
+                    url,
+                    headers=req_headers,
+                    content=body,
+                    timeout=timeout,
+                )
+            else:
+                upstream = await self._client.request(
+                    method,
+                    url,
+                    headers=req_headers,
+                    content=body,
+                    timeout=timeout,
+                )
         except httpx.HTTPError as e:
             # 网络层错误也视为该密钥本次失败，允许故障转移
             detail = f"网络错误：{type(e).__name__}: {e}"
@@ -375,7 +393,11 @@ class ProxyEngine:
     def _inject_key(
         self, svc: ServiceConfig, base_headers: dict[str, str], key: str | None, extra_path: str = "",
     ) -> tuple[str, dict[str, str]]:
-        """根据服务鉴权方式注入密钥，返回 (url, headers)。"""
+        """根据服务鉴权方式注入密钥，返回 (url, headers)。
+
+        原生服务（upstream_url 以 native:// 开头）保持标记，由调用方
+        通过 NativeClient 在进程内转发。
+        """
         url = svc.upstream_url
         if extra_path:
             # 针对 Streamable HTTP 协议，客户端（如 Cursor/VS Code）在连接时，
@@ -384,9 +406,7 @@ class ProxyEngine:
             # 此时追加 extra_path 会导致请求变成 "/mcp/mcp" 从而触发 404 错误。
             # 因此，如果 extra_path 是 "/mcp" 且上游 URL 已经以 "/mcp" 结尾，我们不重复追加。
             normalized_extra = extra_path.strip("/")
-            if normalized_extra == "mcp" and url.rstrip("/").endswith("/mcp"):
-                pass
-            else:
+            if not (normalized_extra == "mcp" and url.rstrip("/").endswith("/mcp")):
                 if url.endswith("/") and extra_path.startswith("/"):
                     url = url.rstrip("/") + extra_path
                 elif not url.endswith("/") and not extra_path.startswith("/"):
@@ -400,6 +420,10 @@ class ProxyEngine:
             elif svc.key_auth.type == "query":
                 sep = "&" if "?" in url else "?"
                 url = f"{url}{sep}{svc.key_auth.param}={key}"
+
+        client: httpx.AsyncClient = (
+            self._native_client._client if is_native_url(url) else self._client
+        )
         return url, headers
 
     @staticmethod

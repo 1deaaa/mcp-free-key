@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import asynccontextmanager, suppress
 import logging
 
@@ -28,7 +29,9 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from .config import AppConfig, load_config
+from .aggregate import AggregateGateway
 from .key_state import KeyStateStore
+from .native import NativeClient
 from .proxy import ProxyEngine, ProxyError
 
 logger = logging.getLogger("mcp_gateway.app")
@@ -65,6 +68,8 @@ def create_app(
         "retest_task": None,
         "reload_lock": asyncio.Lock(),
         "access_keys": set(config.gateway.access_keys),
+        "aggregate": None,
+        "native_client": None,
     }
 
     async def on_startup() -> None:
@@ -80,6 +85,8 @@ def create_app(
                 state["client"],
                 state_store=state["key_state_store"],
             )
+        if state["aggregate"] is None:
+            state["aggregate"] = AggregateGateway(state["engine"])
 
         async def retest_loop() -> None:
             """周期性领取冷却到期密钥并执行自动复测。"""
@@ -129,6 +136,61 @@ def create_app(
                 status_code=401,
             )
         return None
+
+    async def handle_aggregate(request: Request) -> Response:
+        """处理一键聚合端点 /mcp（需开启 GATEWAY_AGGREGATE_ENABLED）。"""
+        denied = _check_access(request)
+        if denied is not None:
+            return denied
+
+        runtime_config: AppConfig = state["config"]
+        if not runtime_config.gateway.aggregate_enabled:
+            return JSONResponse(
+                {"error": "aggregate_disabled",
+                 "message": "一键聚合未开启：请在 GUI 打开「一键聚合开关」后再访问 /mcp"},
+                status_code=404,
+            )
+        aggregate: AggregateGateway | None = state.get("aggregate")
+        if aggregate is None:
+            return JSONResponse({"error": "aggregate_unavailable"}, status_code=503)
+
+        try:
+            payload = json.loads((await request.body() or b"{}").decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": None,
+                 "error": {"code": -32700, "message": "请求体不是合法 JSON"}},
+                status_code=400,
+            )
+        method = payload.get("method", "")
+        request_id = payload.get("id")
+        fwd_headers = {k: v for k, v in request.headers.items()}
+
+        if method == "notifications/initialized":
+            return Response(status_code=202)
+        if method == "initialize":
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": request_id, "result": aggregate.describe()}
+            )
+        if method == "tools/list":
+            tools, _routes = await aggregate.build_catalog(fwd_headers)
+            return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": {"tools": tools}})
+        if method == "tools/call":
+            params = payload.get("params") or {}
+            status_code, body = await aggregate.call_tool(
+                str(params.get("name", "")),
+                params.get("arguments") or {},
+                request_id,
+                fwd_headers,
+            )
+            return JSONResponse(body, status_code=status_code)
+        if method == "ping":
+            return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": {}})
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": request_id,
+             "error": {"code": -32601, "message": f"聚合端点不支持方法：{method}"}},
+            status_code=405,
+        )
 
     async def handle_service(request: Request) -> Response:
         """处理 /{service} 的 MCP 转发请求。"""
@@ -247,6 +309,7 @@ def create_app(
             state["config"] = new_config
             state["engine"] = new_engine
             state["access_keys"] = set(new_config.gateway.access_keys)
+            state["aggregate"] = AggregateGateway(new_engine)
             request.app.state.config = new_config
 
         logger.info("配置已热加载，服务：%s", [s.name for s in new_config.services])
@@ -288,6 +351,10 @@ def create_app(
         Route("/admin/reset-key", handle_reset_key, methods=["POST"]),
         Route("/admin/reload", handle_reload, methods=["POST"]),
         Route("/admin/restart", handle_restart, methods=["POST"]),
+        # 一键聚合端点必须排在 /{service} 通配路由之前，
+        # 否则 /mcp 会被误判为名为 mcp 的服务。
+        Route("/mcp", handle_aggregate, methods=["POST", "GET"]),
+        Route("/mcp/", handle_aggregate, methods=["POST", "GET"]),
         Route("/{service}", handle_service, methods=["GET", "POST", "DELETE"]),
         Route("/{service}/{rest:path}", handle_service, methods=["GET", "POST", "DELETE"]),
     ]
@@ -301,4 +368,6 @@ def create_app(
             client,
             state_store=state["key_state_store"],
         )
+        state["aggregate"] = AggregateGateway(state["engine"])
+    # client 为 None 时由 lifespan.on_startup 统一补建 engine/aggregate。
     return app

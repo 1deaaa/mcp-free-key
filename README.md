@@ -39,7 +39,9 @@
    - **正文特征匹配**：针对 Tavily 这类即使额度耗尽也返回 `HTTP 200` 的服务，支持配置专属失败特征词（如 `exceeds your plan`）进行精准识别。
    - **故障转移**：一旦判定密钥失效，自动在当前请求中无缝切换到下一把可用密钥重试。
 5. **失败密钥自动复测**：密钥失败后默认冷却 120 秒，冷却期间不会参与请求；冷却结束后由后台自动复测，复测成功恢复，复测失败永久禁用并保留原始错误。UTC 每月 1 日 00:00 会清零月度成功次数，并自动恢复因 Tavily `432`、`433` 或明确月度免费额度耗尽提示而永久禁用的密钥。
-6. **高分屏图形配置器**：内置 Tkinter 图形界面，支持高 DPI 完美缩放，所有字体 ≥ 13pt，支持批量导入去重、密钥状态着色（正常-绿色、冷却-橙色、禁用-红色）、一键手动恢复以及重启本地网关。密钥、失败特征和网关设置修改后会自动写入并立即应用，无需单独保存；删除全部上游密钥后，该服务会返回 503，避免无密钥转发。
+6. **一键聚合**：GUI 顶部的「一键聚合开关」开启后，可用根路径 `/mcp` 一次连接访问全部已启用服务。网关把各服务的 `tools/list` 汇总为 `<服务>_<原工具名>` 的工具目录，并原样透传上游的工具说明与参数定义；`tools/call` 按工具前缀自动路由到归属服务并复用同一套密钥轮询、故障转移与会话粘连。聚合端点与既有的 `/context7`、`/tavily`、`/serper` 等后缀路由完全正交，互不影响。
+7. **原生 Serper 支持**：serper.dev 没有官方托管的远端 MCP 端点，网关为其内置了原生 MCP 服务（`provider: serper`，`upstream_url: native://serper`），完整对应 12 种搜索/抓取工具与 `credits` 额度工具，直接把官方 REST API 包装为标准 MCP 端点（`/serper`，聚合时为 `serper_*`）；同样支持密钥池轮询、故障转移、深度校验与「查询额度」（剩余额度 + 每秒限速）。
+8. **高分屏图形配置器**：内置 Tkinter 图形界面，支持高 DPI 完美缩放，所有字体 ≥ 13pt，支持批量导入去重、密钥状态着色（正常-绿色、冷却-橙色、禁用-红色）、一键手动恢复以及重启本地网关。密钥、失败特征和网关设置修改后会自动写入并立即应用，无需单独保存；删除全部上游密钥后，该服务会返回 503，避免无密钥转发。
 
 ---
 
@@ -55,6 +57,32 @@ gateway:
   max_failover_retries: 1         # 单次请求允许的最大转移次数，不含首次请求
   upstream_timeout_seconds: 120   # 转发上游的超时时间（秒）
   routing_mode: round_robin       # round_robin：轮询；primary_backup：主备
+  aggregate_enabled: false       # 一键聚合开关（GUI 右上角同步控制），开启后 /mcp 生效
+
+services:
+  # ... context7 / tavily 同上 ...
+  - name: serper                  # 原生服务：无官方托管 MCP，由网关内置实现
+    provider: serper              # 原生提供方名（省略时回退为 name）
+    enabled: true
+    upstream_url: "native://serper"  # native:// 前缀标识进程内原生服务
+    key_auth:
+      enabled: true
+      type: header                # 原生 Serper 按官方 REST 要求以 X-API-KEY 注入
+      param: "X-API-KEY"
+    keys:
+      - "your-serper-api-key"
+    failure_patterns:             # 与官方 REST 错误语义一一对应
+      - "401"
+      - "403"
+      - "429"
+      - unauthorized
+      - invalid api key
+      - not enough credits
+      - insufficient credits
+      - credits exhausted
+      - out of credits
+      - rate limit
+      - too many requests
 
 services:
   - name: context7                # 服务名（对应网关路由路径，如 /context7）

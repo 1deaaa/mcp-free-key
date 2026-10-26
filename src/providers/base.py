@@ -27,6 +27,8 @@ class UsageSnapshot:
     account_limit: int | None = None
     paygo_usage: int | None = None
     paygo_limit: int | None = None
+    balance: int | None = None       # 剩余额度（预付次数型平台，如 Serper 积分）
+    rate_limit: int | None = None    # 平台限速（每秒请求数）
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -48,12 +50,28 @@ class UsageSnapshot:
             return None
         return self.account_limit - self.account_usage
 
+    @property
+    def has_quota_info(self) -> bool:
+        """是否成功取回任何可用于展示的额度信息。"""
+        return any(
+            value is not None
+            for value in (
+                self.key_limit,
+                self.account_limit,
+                self.paygo_limit,
+                self.balance,
+            )
+        )
+
 
 class ServiceProvider:
     """平台提供方基类。"""
 
     service_name: str = ""
     supports_usage: bool = False
+    # 原生 MCP 服务：网关直接实现 MCP 协议并由其代理到该平台的 REST 接口。
+    # 仅当服务未提供可用的远程 MCP 上游时才启用。
+    native: bool = False
 
     def get_probe(self) -> ProbeSpec | None:
         """返回默认探针。"""
@@ -63,3 +81,18 @@ class ServiceProvider:
         """查询单把密钥的额度。默认不支持。"""
         _ = (key, timeout)
         return None
+
+    def list_tools(self) -> list[dict[str, Any]]:
+        """返回原生 MCP 服务的工具清单（仅 native=True 时有效）。"""
+        return []
+
+    async def call_tool(
+        self, tool: str, arguments: dict[str, Any], key: str, timeout: float = 30.0
+    ) -> tuple[int, Any]:
+        """执行原生 MCP 工具调用。
+
+        Returns:
+            (上游 HTTP 状态码, 结构化结果) 二元组。
+        """
+        _ = (tool, arguments, key, timeout)
+        return 404, {"message": "该服务未实现原生工具调用"}

@@ -284,6 +284,13 @@ class GatewayAppUI:
             value=True,
             label_position=ft.LabelPosition.LEFT,
         )
+        self.aggregate_switch = ft.Switch(
+            label="一键聚合开关",
+            value=False,
+            label_position=ft.LabelPosition.LEFT,
+            tooltip="开启后可用 /mcp 一次访问全部服务，不影响各服务后缀路由",
+            on_change=self.handle_aggregate_toggle,
+        )
 
         # 状态指示灯与文字
         self.status_indicator = ft.Container(
@@ -489,6 +496,7 @@ class GatewayAppUI:
 
         actions_row = ft.Row(
             controls=[
+                self.aggregate_switch,
                 self.auto_apply_switch,
                 ft.ElevatedButton(
                     "重启服务",
@@ -867,6 +875,11 @@ class GatewayAppUI:
                     style=ft.ButtonStyle(bgcolor=CLR_ACCENT),
                     on_click=self.handle_copy_mcp_config,
                 ),
+                ft.OutlinedButton(
+                    "复制一键聚合配置",
+                    icon=ft.Icons.HUB_ROUNDED,
+                    on_click=self.handle_copy_aggregate_config,
+                ),
             ],
             spacing=10,
         )
@@ -937,6 +950,7 @@ class GatewayAppUI:
         self.cooldown_input.value = str(gw.key_cooldown_seconds)
         self.retries_input.value = str(gw.max_failover_retries)
         self.timeout_input.value = str(gw.upstream_timeout_seconds)
+        self.aggregate_switch.value = bool(gw.aggregate_enabled)
 
         self.refresh_service_list()
         if 0 <= self.current_service_index < len(self.manager.config.services):
@@ -1194,6 +1208,7 @@ class GatewayAppUI:
                 key_type=self.key_type_dropdown.value or "header",
                 key_param=self.key_param_input.value or "",
                 failure_patterns=split_lines(self.patterns_input.value or ""),
+                provider=self.manager.config.services[self.current_service_index].provider,
             )
             self._schedule_auto_apply()
         except Exception as exc:
@@ -1249,7 +1264,25 @@ class GatewayAppUI:
             retries=retries,
             timeout=timeout,
             routing_mode=mode,
+            aggregate_enabled=bool(self.aggregate_switch.value),
         )
+
+    def handle_aggregate_toggle(self, e=None) -> None:
+        """一键聚合开关切换：保存并热重载，不影响各服务后缀路由。"""
+        try:
+            self._sync_gateway_from_fields()
+            self.manager.write_config_to_disk()
+            self.manager.apply_runtime_sync(
+                self.manager.config.gateway.port,
+                self.manager.config.gateway.access_keys[0]
+                if self.manager.config.gateway.access_keys
+                else "",
+            )
+            state = "开启" if self.aggregate_switch.value else "关闭"
+            self.log(f"✅ 一键聚合已{state}：/mcp 生效，各 /<服务> 路由保持不变")
+        except Exception as exc:
+            self.log(f"⚠️ 一键聚合切换未完成: {exc}")
+        self.page.update()
 
     def handle_add_service(self, e=None) -> None:
         """打开添加第三方 MCP 服务弹窗。"""
@@ -1749,6 +1782,11 @@ class GatewayAppUI:
 
     def handle_copy_mcp_config(self, e=None) -> None:
         self._copy_text(self.mcp_config_display.value or "", "MCP 客户端配置已复制到剪贴板！")
+
+    def handle_copy_aggregate_config(self, e=None) -> None:
+        """复制根路径 /mcp 的一键聚合客户端配置。"""
+        config = self.manager.generate_mcp_config("aggregate", self.mcp_client_type)
+        self._copy_text(config, "一键聚合 MCP 配置已复制到剪贴板！")
 
     def handle_clear_logs(self, e=None) -> None:
         self.log_listview.controls.clear()
