@@ -1,5 +1,5 @@
 # MCP 聚合网关依赖
-# 运行环境：Python 3.12 (conda env: llm)
+# 运行环境：本机 conda base（Python 3.13）
 
 # ASGI Web 框架（轻量，原生支持 SSE 流式响应）
 starlette>=0.37.0
